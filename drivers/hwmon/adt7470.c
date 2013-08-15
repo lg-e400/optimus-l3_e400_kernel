@@ -215,7 +215,7 @@ static inline int adt7470_write_word_data(struct i2c_client *client, u8 reg,
 					  u16 value)
 {
 	return i2c_smbus_write_byte_data(client, reg, value & 0xFF)
-	       && i2c_smbus_write_byte_data(client, reg + 1, value >> 8);
+	       || i2c_smbus_write_byte_data(client, reg + 1, value >> 8);
 }
 
 static void adt7470_init_client(struct i2c_client *client)
@@ -452,7 +452,7 @@ static ssize_t set_auto_update_interval(struct device *dev,
 	if (kstrtol(buf, 10, &temp))
 		return -EINVAL;
 
-	temp = SENSORS_LIMIT(temp, 0, 60000);
+	temp = clamp_val(temp, 0, 60000);
 
 	mutex_lock(&data->lock);
 	data->auto_update_interval = temp;
@@ -481,7 +481,7 @@ static ssize_t set_num_temp_sensors(struct device *dev,
 	if (kstrtol(buf, 10, &temp))
 		return -EINVAL;
 
-	temp = SENSORS_LIMIT(temp, -1, 10);
+	temp = clamp_val(temp, -1, 10);
 
 	mutex_lock(&data->lock);
 	data->num_temp_sensors = temp;
@@ -515,7 +515,7 @@ static ssize_t set_temp_min(struct device *dev,
 		return -EINVAL;
 
 	temp = DIV_ROUND_CLOSEST(temp, 1000);
-	temp = SENSORS_LIMIT(temp, 0, 255);
+	temp = clamp_val(temp, 0, 255);
 
 	mutex_lock(&data->lock);
 	data->temp_min[attr->index] = temp;
@@ -549,7 +549,7 @@ static ssize_t set_temp_max(struct device *dev,
 		return -EINVAL;
 
 	temp = DIV_ROUND_CLOSEST(temp, 1000);
-	temp = SENSORS_LIMIT(temp, 0, 255);
+	temp = clamp_val(temp, 0, 255);
 
 	mutex_lock(&data->lock);
 	data->temp_max[attr->index] = temp;
@@ -604,7 +604,7 @@ static ssize_t set_fan_max(struct device *dev,
 		return -EINVAL;
 
 	temp = FAN_RPM_TO_PERIOD(temp);
-	temp = SENSORS_LIMIT(temp, 1, 65534);
+	temp = clamp_val(temp, 1, 65534);
 
 	mutex_lock(&data->lock);
 	data->fan_max[attr->index] = temp;
@@ -641,7 +641,7 @@ static ssize_t set_fan_min(struct device *dev,
 		return -EINVAL;
 
 	temp = FAN_RPM_TO_PERIOD(temp);
-	temp = SENSORS_LIMIT(temp, 1, 65534);
+	temp = clamp_val(temp, 1, 65534);
 
 	mutex_lock(&data->lock);
 	data->fan_min[attr->index] = temp;
@@ -717,7 +717,7 @@ static ssize_t set_pwm(struct device *dev, struct device_attribute *devattr,
 	if (kstrtol(buf, 10, &temp))
 		return -EINVAL;
 
-	temp = SENSORS_LIMIT(temp, 0, 255);
+	temp = clamp_val(temp, 0, 255);
 
 	mutex_lock(&data->lock);
 	data->pwm[attr->index] = temp;
@@ -749,7 +749,7 @@ static ssize_t set_pwm_max(struct device *dev,
 	if (kstrtol(buf, 10, &temp))
 		return -EINVAL;
 
-	temp = SENSORS_LIMIT(temp, 0, 255);
+	temp = clamp_val(temp, 0, 255);
 
 	mutex_lock(&data->lock);
 	data->pwm_max[attr->index] = temp;
@@ -782,7 +782,7 @@ static ssize_t set_pwm_min(struct device *dev,
 	if (kstrtol(buf, 10, &temp))
 		return -EINVAL;
 
-	temp = SENSORS_LIMIT(temp, 0, 255);
+	temp = clamp_val(temp, 0, 255);
 
 	mutex_lock(&data->lock);
 	data->pwm_min[attr->index] = temp;
@@ -826,7 +826,7 @@ static ssize_t set_pwm_tmin(struct device *dev,
 		return -EINVAL;
 
 	temp = DIV_ROUND_CLOSEST(temp, 1000);
-	temp = SENSORS_LIMIT(temp, 0, 255);
+	temp = clamp_val(temp, 0, 255);
 
 	mutex_lock(&data->lock);
 	data->pwm_tmin[attr->index] = temp;

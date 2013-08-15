@@ -612,7 +612,7 @@ void c2_free_qp(struct c2_dev *c2dev, struct c2_qp *qp)
 	c2_unlock_cqs(send_cq, recv_cq);
 
 	/*
-	 * Destory qp in the rnic...
+	 * Destroy qp in the rnic...
 	 */
 	destroy_qp(c2dev, qp);
 
@@ -1010,13 +1010,13 @@ out:
 	return err;
 }
 
-void __devinit c2_init_qp_table(struct c2_dev *c2dev)
+void c2_init_qp_table(struct c2_dev *c2dev)
 {
 	spin_lock_init(&c2dev->qp_table.lock);
 	idr_init(&c2dev->qp_table.idr);
 }
 
-void __devexit c2_cleanup_qp_table(struct c2_dev *c2dev)
+void c2_cleanup_qp_table(struct c2_dev *c2dev)
 {
 	idr_destroy(&c2dev->qp_table.idr);
 }

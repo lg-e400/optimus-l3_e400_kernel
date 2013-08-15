@@ -198,7 +198,7 @@ int ccw_device_start_key(struct ccw_device *cdev, struct ccw1 *cpa,
 	if (cdev->private->state == DEV_STATE_VERIFY) {
 		/* Remember to fake irb when finished. */
 		if (!cdev->private->flags.fake_irb) {
-			cdev->private->flags.fake_irb = 1;
+			cdev->private->flags.fake_irb = FAKE_CMD_IRB;
 			cdev->private->intparm = intparm;
 			return 0;
 		} else
@@ -213,9 +213,9 @@ int ccw_device_start_key(struct ccw_device *cdev, struct ccw1 *cpa,
 	ret = cio_set_options (sch, flags);
 	if (ret)
 		return ret;
-	/* Adjust requested path mask to excluded varied off paths. */
+	/* Adjust requested path mask to exclude unusable paths. */
 	if (lpm) {
-		lpm &= sch->opm;
+		lpm &= sch->lpm;
 		if (lpm == 0)
 			return -EACCES;
 	}
@@ -418,11 +418,8 @@ int ccw_device_resume(struct ccw_device *cdev)
 int
 ccw_device_call_handler(struct ccw_device *cdev)
 {
-	struct subchannel *sch;
 	unsigned int stctl;
 	int ending_status;
-
-	sch = to_subchannel(cdev->dev.parent);
 
 	/*
 	 * we allow for the device action handler if .
@@ -608,11 +605,21 @@ int ccw_device_tm_start_key(struct ccw_device *cdev, struct tcw *tcw,
 	sch = to_subchannel(cdev->dev.parent);
 	if (!sch->schib.pmcw.ena)
 		return -EINVAL;
+	if (cdev->private->state == DEV_STATE_VERIFY) {
+		/* Remember to fake irb when finished. */
+		if (!cdev->private->flags.fake_irb) {
+			cdev->private->flags.fake_irb = FAKE_TM_IRB;
+			cdev->private->intparm = intparm;
+			return 0;
+		} else
+			/* There's already a fake I/O around. */
+			return -EBUSY;
+	}
 	if (cdev->private->state != DEV_STATE_ONLINE)
 		return -EIO;
-	/* Adjust requested path mask to excluded varied off paths. */
+	/* Adjust requested path mask to exclude unusable paths. */
 	if (lpm) {
-		lpm &= sch->opm;
+		lpm &= sch->lpm;
 		if (lpm == 0)
 			return -EACCES;
 	}
@@ -748,14 +755,18 @@ int ccw_device_tm_intrg(struct ccw_device *cdev)
 }
 EXPORT_SYMBOL(ccw_device_tm_intrg);
 
-// FIXME: these have to go:
-
-int
-_ccw_device_get_subchannel_number(struct ccw_device *cdev)
+/**
+ * ccw_device_get_schid - obtain a subchannel id
+ * @cdev: device to obtain the id for
+ * @schid: where to fill in the values
+ */
+void ccw_device_get_schid(struct ccw_device *cdev, struct subchannel_id *schid)
 {
-	return cdev->private->schid.sch_no;
-}
+	struct subchannel *sch = to_subchannel(cdev->dev.parent);
 
+	*schid = sch->schid;
+}
+EXPORT_SYMBOL_GPL(ccw_device_get_schid);
 
 MODULE_LICENSE("GPL");
 EXPORT_SYMBOL(ccw_device_set_options_mask);
@@ -770,5 +781,4 @@ EXPORT_SYMBOL(ccw_device_start_timeout_key);
 EXPORT_SYMBOL(ccw_device_start_key);
 EXPORT_SYMBOL(ccw_device_get_ciw);
 EXPORT_SYMBOL(ccw_device_get_path_mask);
-EXPORT_SYMBOL(_ccw_device_get_subchannel_number);
 EXPORT_SYMBOL_GPL(ccw_device_get_chp_desc);

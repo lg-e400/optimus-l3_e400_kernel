@@ -3,6 +3,7 @@
 
 #include <linux/ssb/ssb.h>
 #include <linux/types.h>
+#include <linux/bcm47xx_wdt.h>
 
 
 #define PFX	"ssb: "
@@ -171,7 +172,8 @@ ssize_t ssb_attr_sprom_store(struct ssb_bus *bus,
 			     const char *buf, size_t count,
 			     int (*sprom_check_crc)(const u16 *sprom, size_t size),
 			     int (*sprom_write)(struct ssb_bus *bus, const u16 *sprom));
-extern const struct ssb_sprom *ssb_get_fallback_sprom(void);
+extern int ssb_fill_sprom_with_fallback(struct ssb_bus *bus,
+					struct ssb_sprom *out);
 
 
 /* core.c */
@@ -205,5 +207,56 @@ static inline void b43_pci_ssb_bridge_exit(void)
 {
 }
 #endif /* CONFIG_SSB_B43_PCI_BRIDGE */
+
+/* driver_chipcommon_pmu.c */
+extern u32 ssb_pmu_get_cpu_clock(struct ssb_chipcommon *cc);
+extern u32 ssb_pmu_get_controlclock(struct ssb_chipcommon *cc);
+extern u32 ssb_pmu_get_alp_clock(struct ssb_chipcommon *cc);
+
+extern u32 ssb_chipco_watchdog_timer_set_wdt(struct bcm47xx_wdt *wdt,
+					     u32 ticks);
+extern u32 ssb_chipco_watchdog_timer_set_ms(struct bcm47xx_wdt *wdt, u32 ms);
+
+#ifdef CONFIG_SSB_DRIVER_EXTIF
+extern u32 ssb_extif_watchdog_timer_set_wdt(struct bcm47xx_wdt *wdt, u32 ticks);
+extern u32 ssb_extif_watchdog_timer_set_ms(struct bcm47xx_wdt *wdt, u32 ms);
+#else
+static inline u32 ssb_extif_watchdog_timer_set_wdt(struct bcm47xx_wdt *wdt,
+						   u32 ticks)
+{
+	return 0;
+}
+static inline u32 ssb_extif_watchdog_timer_set_ms(struct bcm47xx_wdt *wdt,
+						  u32 ms)
+{
+	return 0;
+}
+#endif
+
+#ifdef CONFIG_SSB_EMBEDDED
+extern int ssb_watchdog_register(struct ssb_bus *bus);
+#else /* CONFIG_SSB_EMBEDDED */
+static inline int ssb_watchdog_register(struct ssb_bus *bus)
+{
+	return 0;
+}
+#endif /* CONFIG_SSB_EMBEDDED */
+
+#ifdef CONFIG_SSB_DRIVER_EXTIF
+extern void ssb_extif_init(struct ssb_extif *extif);
+#else
+static inline void ssb_extif_init(struct ssb_extif *extif)
+{
+}
+#endif
+
+#ifdef CONFIG_SSB_DRIVER_GPIO
+extern int ssb_gpio_init(struct ssb_bus *bus);
+#else /* CONFIG_SSB_DRIVER_GPIO */
+static inline int ssb_gpio_init(struct ssb_bus *bus)
+{
+	return -ENOTSUPP;
+}
+#endif /* CONFIG_SSB_DRIVER_GPIO */
 
 #endif /* LINUX_SSB_PRIVATE_H_ */

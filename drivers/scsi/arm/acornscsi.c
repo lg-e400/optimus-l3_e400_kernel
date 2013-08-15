@@ -100,7 +100,7 @@
  */
 #define TIMEOUT_TIME 10
 /*
- * Define this if you want to have verbose explaination of SCSI
+ * Define this if you want to have verbose explanation of SCSI
  * status/messages.
  */
 #undef CONFIG_ACORNSCSI_CONSTANTS
@@ -138,7 +138,6 @@
 #include <linux/stringify.h>
 #include <linux/io.h>
 
-#include <asm/system.h>
 #include <asm/ecard.h>
 
 #include "../scsi.h"
@@ -1561,7 +1560,7 @@ void acornscsi_message(AS_Host *host)
 	/*
 	 * If we were negociating sync transfer, we don't yet know if
 	 * this REJECT is for the sync transfer or for the tagged queue/wide
-	 * transfer.  Re-initiate sync transfer negociation now, and if
+	 * transfer.  Re-initiate sync transfer negotiation now, and if
 	 * we got a REJECT in response to SDTR, then it'll be set to DONE.
 	 */
 	if (host->device[host->SCpnt->device->id].sync_state == SYNC_SENT_REQUEST)
@@ -2966,8 +2965,7 @@ static struct scsi_host_template acornscsi_template = {
 	.proc_name		= "acornscsi",
 };
 
-static int __devinit
-acornscsi_probe(struct expansion_card *ec, const struct ecard_id *id)
+static int acornscsi_probe(struct expansion_card *ec, const struct ecard_id *id)
 {
 	struct Scsi_Host *host;
 	AS_Host *ashost;
@@ -3033,7 +3031,7 @@ acornscsi_probe(struct expansion_card *ec, const struct ecard_id *id)
 	return ret;
 }
 
-static void __devexit acornscsi_remove(struct expansion_card *ec)
+static void acornscsi_remove(struct expansion_card *ec)
 {
 	struct Scsi_Host *host = ecard_get_drvdata(ec);
 	AS_Host *ashost = (AS_Host *)host->hostdata;
@@ -3064,7 +3062,7 @@ static const struct ecard_id acornscsi_cids[] = {
 
 static struct ecard_driver acornscsi_driver = {
 	.probe		= acornscsi_probe,
-	.remove		= __devexit_p(acornscsi_remove),
+	.remove		= acornscsi_remove,
 	.id_table	= acornscsi_cids,
 	.drv = {
 		.name		= "acornscsi",

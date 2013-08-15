@@ -53,7 +53,7 @@ void cifs_dfs_release_automount_timer(void)
  *
  * Extracts sharename form full UNC.
  * i.e. strips from UNC trailing path that is not part of share
- * name and fixup missing '\' in the begining of DFS node refferal
+ * name and fixup missing '\' in the beginning of DFS node refferal
  * if necessary.
  * Returns pointer to share name on success or ERR_PTR on error.
  * Caller is responsible for freeing returned string.
@@ -141,10 +141,11 @@ char *cifs_compose_mount_options(const char *sb_mountdata,
 
 	rc = dns_resolve_server_name_to_ip(*devname, &srvIP);
 	if (rc < 0) {
-		cERROR(1, "%s: Failed to resolve server part of %s to IP: %d",
-			  __func__, *devname, rc);
+		cFYI(1, "%s: Failed to resolve server part of %s to IP: %d",
+			__func__, *devname, rc);
 		goto compose_mount_options_err;
 	}
+
 	/* md_len = strlen(...) + 12 for 'sep+prefixpath='
 	 * assuming that we have 'unc=' and 'ip=' in
 	 * the original sb_mountdata
@@ -225,6 +226,8 @@ compose_mount_options_out:
 compose_mount_options_err:
 	kfree(mountdata);
 	mountdata = ERR_PTR(rc);
+	kfree(*devname);
+	*devname = NULL;
 	goto compose_mount_options_out;
 }
 
@@ -272,9 +275,10 @@ static struct vfsmount *cifs_dfs_do_automount(struct dentry *mntpt)
 	struct dfs_info3_param *referrals = NULL;
 	unsigned int num_referrals = 0;
 	struct cifs_sb_info *cifs_sb;
-	struct cifsSesInfo *ses;
+	struct cifs_ses *ses;
 	char *full_path;
-	int xid, i;
+	unsigned int xid;
+	int i;
 	int rc;
 	struct vfsmount *mnt;
 	struct tcon_link *tlink;
@@ -301,11 +305,11 @@ static struct vfsmount *cifs_dfs_do_automount(struct dentry *mntpt)
 	}
 	ses = tlink_tcon(tlink)->ses;
 
-	xid = GetXid();
+	xid = get_xid();
 	rc = get_dfs_path(xid, ses, full_path + 1, cifs_sb->local_nls,
 		&num_referrals, &referrals,
 		cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MAP_SPECIAL_CHR);
-	FreeXid(xid);
+	free_xid(xid);
 
 	cifs_put_tlink(tlink);
 

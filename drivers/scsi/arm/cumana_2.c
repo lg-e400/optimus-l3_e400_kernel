@@ -344,7 +344,7 @@ cumanascsi_2_set_proc_info(struct Scsi_Host *host, char *buffer, int length)
  * Params   : buffer - a buffer to write information to
  *	      start  - a pointer into this buffer set by this routine to the start
  *		       of the required information.
- *	      offset - offset into information that we have read upto.
+ *	      offset - offset into information that we have read up to.
  *	      length - length of buffer
  *	      host_no - host number to return information for
  *	      inout  - 0 for reading, 1 for writing.
@@ -397,8 +397,8 @@ static struct scsi_host_template cumanascsi2_template = {
 	.proc_name			= "cumanascsi2",
 };
 
-static int __devinit
-cumanascsi2_probe(struct expansion_card *ec, const struct ecard_id *id)
+static int cumanascsi2_probe(struct expansion_card *ec,
+			     const struct ecard_id *id)
 {
 	struct Scsi_Host *host;
 	struct cumanascsi2_info *info;
@@ -495,7 +495,7 @@ cumanascsi2_probe(struct expansion_card *ec, const struct ecard_id *id)
 	return ret;
 }
 
-static void __devexit cumanascsi2_remove(struct expansion_card *ec)
+static void cumanascsi2_remove(struct expansion_card *ec)
 {
 	struct Scsi_Host *host = ecard_get_drvdata(ec);
 	struct cumanascsi2_info *info = (struct cumanascsi2_info *)host->hostdata;
@@ -519,7 +519,7 @@ static const struct ecard_id cumanascsi2_cids[] = {
 
 static struct ecard_driver cumanascsi2_driver = {
 	.probe		= cumanascsi2_probe,
-	.remove		= __devexit_p(cumanascsi2_remove),
+	.remove		= cumanascsi2_remove,
 	.id_table	= cumanascsi2_cids,
 	.drv = {
 		.name		= "cumanascsi2",

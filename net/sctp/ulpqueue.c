@@ -105,10 +105,7 @@ int sctp_ulpq_tail_data(struct sctp_ulpq *ulpq, struct sctp_chunk *chunk,
 			gfp_t gfp)
 {
 	struct sk_buff_head temp;
-	sctp_data_chunk_t *hdr;
 	struct sctp_ulpevent *event;
-
-	hdr = (sctp_data_chunk_t *) chunk->chunk_hdr;
 
 	/* Create an event from the incoming chunk. */
 	event = sctp_ulpevent_make_rcvmsg(chunk->asoc, chunk, gfp);
@@ -243,7 +240,7 @@ int sctp_ulpq_tail_event(struct sctp_ulpq *ulpq, struct sctp_ulpevent *event)
 		} else {
 			/*
 			 * If fragment interleave is enabled, we
-			 * can queue this to the recieve queue instead
+			 * can queue this to the receive queue instead
 			 * of the lobby.
 			 */
 			if (sctp_sk(sk)->frag_interleave)
@@ -329,7 +326,9 @@ static void sctp_ulpq_store_reasm(struct sctp_ulpq *ulpq,
  * payload was fragmented on the way and ip had to reassemble them.
  * We add the rest of skb's to the first skb's fraglist.
  */
-static struct sctp_ulpevent *sctp_make_reassembled_event(struct sk_buff_head *queue, struct sk_buff *f_frag, struct sk_buff *l_frag)
+static struct sctp_ulpevent *sctp_make_reassembled_event(struct net *net,
+	struct sk_buff_head *queue, struct sk_buff *f_frag,
+	struct sk_buff *l_frag)
 {
 	struct sk_buff *pos;
 	struct sk_buff *new = NULL;
@@ -397,7 +396,7 @@ static struct sctp_ulpevent *sctp_make_reassembled_event(struct sk_buff_head *qu
 	}
 
 	event = sctp_skb2event(f_frag);
-	SCTP_INC_STATS(SCTP_MIB_REASMUSRMSGS);
+	SCTP_INC_STATS(net, SCTP_MIB_REASMUSRMSGS);
 
 	return event;
 }
@@ -496,7 +495,8 @@ static struct sctp_ulpevent *sctp_ulpq_retrieve_reassembled(struct sctp_ulpq *ul
 		cevent = sctp_skb2event(pd_first);
 		pd_point = sctp_sk(asoc->base.sk)->pd_point;
 		if (pd_point && pd_point <= pd_len) {
-			retval = sctp_make_reassembled_event(&ulpq->reasm,
+			retval = sctp_make_reassembled_event(sock_net(asoc->base.sk),
+							     &ulpq->reasm,
 							     pd_first,
 							     pd_last);
 			if (retval)
@@ -506,7 +506,8 @@ static struct sctp_ulpevent *sctp_ulpq_retrieve_reassembled(struct sctp_ulpq *ul
 done:
 	return retval;
 found:
-	retval = sctp_make_reassembled_event(&ulpq->reasm, first_frag, pos);
+	retval = sctp_make_reassembled_event(sock_net(ulpq->asoc->base.sk),
+					     &ulpq->reasm, first_frag, pos);
 	if (retval)
 		retval->msg_flags |= MSG_EOR;
 	goto done;
@@ -566,7 +567,8 @@ static struct sctp_ulpevent *sctp_ulpq_retrieve_partial(struct sctp_ulpq *ulpq)
 	 * further.
 	 */
 done:
-	retval = sctp_make_reassembled_event(&ulpq->reasm, first_frag, last_frag);
+	retval = sctp_make_reassembled_event(sock_net(ulpq->asoc->base.sk),
+					&ulpq->reasm, first_frag, last_frag);
 	if (retval && is_last)
 		retval->msg_flags |= MSG_EOR;
 
@@ -658,7 +660,8 @@ static struct sctp_ulpevent *sctp_ulpq_retrieve_first(struct sctp_ulpq *ulpq)
 	 * further.
 	 */
 done:
-	retval = sctp_make_reassembled_event(&ulpq->reasm, first_frag, last_frag);
+	retval = sctp_make_reassembled_event(sock_net(ulpq->asoc->base.sk),
+					&ulpq->reasm, first_frag, last_frag);
 	return retval;
 }
 
@@ -743,11 +746,9 @@ static void sctp_ulpq_retrieve_ordered(struct sctp_ulpq *ulpq,
 	struct sk_buff *pos, *tmp;
 	struct sctp_ulpevent *cevent;
 	struct sctp_stream *in;
-	__u16 sid, csid;
-	__u16 ssn, cssn;
+	__u16 sid, csid, cssn;
 
 	sid = event->stream;
-	ssn = event->ssn;
 	in  = &ulpq->asoc->ssnmap->in;
 
 	event_list = (struct sk_buff_head *) sctp_event2skb(event)->prev;
@@ -996,7 +997,6 @@ static __u16 sctp_ulpq_renege_frags(struct sctp_ulpq *ulpq, __u16 needed)
 
 /* Partial deliver the first message as there is pressure on rwnd. */
 void sctp_ulpq_partial_delivery(struct sctp_ulpq *ulpq,
-				struct sctp_chunk *chunk,
 				gfp_t gfp)
 {
 	struct sctp_ulpevent *event;
@@ -1056,10 +1056,10 @@ void sctp_ulpq_renege(struct sctp_ulpq *ulpq, struct sctp_chunk *chunk,
 	if (chunk && (freed >= needed)) {
 		__u32 tsn;
 		tsn = ntohl(chunk->subh.data_hdr->tsn);
-		sctp_tsnmap_mark(&asoc->peer.tsn_map, tsn);
+		sctp_tsnmap_mark(&asoc->peer.tsn_map, tsn, chunk->transport);
 		sctp_ulpq_tail_data(ulpq, chunk, gfp);
 
-		sctp_ulpq_partial_delivery(ulpq, chunk, gfp);
+		sctp_ulpq_partial_delivery(ulpq, gfp);
 	}
 
 	sk_mem_reclaim(asoc->base.sk);

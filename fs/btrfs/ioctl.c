@@ -40,6 +40,8 @@
 #include <linux/xattr.h>
 #include <linux/vmalloc.h>
 #include <linux/slab.h>
+#include <linux/blkdev.h>
+#include <linux/uuid.h>
 #include "compat.h"
 #include "ctree.h"
 #include "disk-io.h"
@@ -49,6 +51,11 @@
 #include "print-tree.h"
 #include "volumes.h"
 #include "locking.h"
+#include "inode-map.h"
+#include "backref.h"
+#include "rcu-string.h"
+#include "send.h"
+#include "dev-replace.h"
 
 /* Mask out flags that are inappropriate for the given type of inode. */
 static inline __u32 btrfs_mask_flags(umode_t mode, __u32 flags)
@@ -80,6 +87,13 @@ static unsigned int btrfs_flags_to_ioctl(unsigned int flags)
 		iflags |= FS_NOATIME_FL;
 	if (flags & BTRFS_INODE_DIRSYNC)
 		iflags |= FS_DIRSYNC_FL;
+	if (flags & BTRFS_INODE_NODATACOW)
+		iflags |= FS_NOCOW_FL;
+
+	if ((flags & BTRFS_INODE_COMPRESS) && !(flags & BTRFS_INODE_NOCOMPRESS))
+		iflags |= FS_COMPR_FL;
+	else if (flags & BTRFS_INODE_NOCOMPRESS)
+		iflags |= FS_NOCOMP_FL;
 
 	return iflags;
 }
@@ -108,7 +122,7 @@ void btrfs_update_iflags(struct inode *inode)
 /*
  * Inherit flags from the parent inode.
  *
- * Unlike extN we don't have any flags we don't want to inherit currently.
+ * Currently only the compression flags and the cow flags are inherited.
  */
 void btrfs_inherit_iflags(struct inode *inode, struct inode *dir)
 {
@@ -119,12 +133,20 @@ void btrfs_inherit_iflags(struct inode *inode, struct inode *dir)
 
 	flags = BTRFS_I(dir)->flags;
 
-	if (S_ISREG(inode->i_mode))
-		flags &= ~BTRFS_INODE_DIRSYNC;
-	else if (!S_ISDIR(inode->i_mode))
-		flags &= (BTRFS_INODE_NODUMP | BTRFS_INODE_NOATIME);
+	if (flags & BTRFS_INODE_NOCOMPRESS) {
+		BTRFS_I(inode)->flags &= ~BTRFS_INODE_COMPRESS;
+		BTRFS_I(inode)->flags |= BTRFS_INODE_NOCOMPRESS;
+	} else if (flags & BTRFS_INODE_COMPRESS) {
+		BTRFS_I(inode)->flags &= ~BTRFS_INODE_NOCOMPRESS;
+		BTRFS_I(inode)->flags |= BTRFS_INODE_COMPRESS;
+	}
 
-	BTRFS_I(inode)->flags = flags;
+	if (flags & BTRFS_INODE_NODATACOW) {
+		BTRFS_I(inode)->flags |= BTRFS_INODE_NODATACOW;
+		if (S_ISREG(inode->i_mode))
+			BTRFS_I(inode)->flags |= BTRFS_INODE_NODATASUM;
+	}
+
 	btrfs_update_iflags(inode);
 }
 
@@ -138,6 +160,21 @@ static int btrfs_ioctl_getflags(struct file *file, void __user *arg)
 	return 0;
 }
 
+static int check_flags(unsigned int flags)
+{
+	if (flags & ~(FS_IMMUTABLE_FL | FS_APPEND_FL | \
+		      FS_NOATIME_FL | FS_NODUMP_FL | \
+		      FS_SYNC_FL | FS_DIRSYNC_FL | \
+		      FS_NOCOMP_FL | FS_COMPR_FL |
+		      FS_NOCOW_FL))
+		return -EOPNOTSUPP;
+
+	if ((flags & FS_NOCOMP_FL) && (flags & FS_COMPR_FL))
+		return -EINVAL;
+
+	return 0;
+}
+
 static int btrfs_ioctl_setflags(struct file *file, void __user *arg)
 {
 	struct inode *inode = file->f_path.dentry->d_inode;
@@ -146,6 +183,9 @@ static int btrfs_ioctl_setflags(struct file *file, void __user *arg)
 	struct btrfs_trans_handle *trans;
 	unsigned int flags, oldflags;
 	int ret;
+	u64 ip_oldflags;
+	unsigned int i_oldflags;
+	umode_t mode;
 
 	if (btrfs_root_readonly(root))
 		return -EROFS;
@@ -153,15 +193,22 @@ static int btrfs_ioctl_setflags(struct file *file, void __user *arg)
 	if (copy_from_user(&flags, arg, sizeof(flags)))
 		return -EFAULT;
 
-	if (flags & ~(FS_IMMUTABLE_FL | FS_APPEND_FL | \
-		      FS_NOATIME_FL | FS_NODUMP_FL | \
-		      FS_SYNC_FL | FS_DIRSYNC_FL))
-		return -EOPNOTSUPP;
+	ret = check_flags(flags);
+	if (ret)
+		return ret;
 
-	if (!is_owner_or_cap(inode))
+	if (!inode_owner_or_capable(inode))
 		return -EACCES;
 
+	ret = mnt_want_write_file(file);
+	if (ret)
+		return ret;
+
 	mutex_lock(&inode->i_mutex);
+
+	ip_oldflags = ip->flags;
+	i_oldflags = inode->i_flags;
+	mode = inode->i_mode;
 
 	flags = btrfs_mask_flags(inode->i_mode, flags);
 	oldflags = btrfs_flags_to_ioctl(ip->flags);
@@ -171,10 +218,6 @@ static int btrfs_ioctl_setflags(struct file *file, void __user *arg)
 			goto out_unlock;
 		}
 	}
-
-	ret = mnt_want_write(file->f_path.mnt);
-	if (ret)
-		goto out_unlock;
 
 	if (flags & FS_SYNC_FL)
 		ip->flags |= BTRFS_INODE_SYNC;
@@ -200,22 +243,69 @@ static int btrfs_ioctl_setflags(struct file *file, void __user *arg)
 		ip->flags |= BTRFS_INODE_DIRSYNC;
 	else
 		ip->flags &= ~BTRFS_INODE_DIRSYNC;
+	if (flags & FS_NOCOW_FL) {
+		if (S_ISREG(mode)) {
+			/*
+			 * It's safe to turn csums off here, no extents exist.
+			 * Otherwise we want the flag to reflect the real COW
+			 * status of the file and will not set it.
+			 */
+			if (inode->i_size == 0)
+				ip->flags |= BTRFS_INODE_NODATACOW
+					   | BTRFS_INODE_NODATASUM;
+		} else {
+			ip->flags |= BTRFS_INODE_NODATACOW;
+		}
+	} else {
+		/*
+		 * Revert back under same assuptions as above
+		 */
+		if (S_ISREG(mode)) {
+			if (inode->i_size == 0)
+				ip->flags &= ~(BTRFS_INODE_NODATACOW
+				             | BTRFS_INODE_NODATASUM);
+		} else {
+			ip->flags &= ~BTRFS_INODE_NODATACOW;
+		}
+	}
 
+	/*
+	 * The COMPRESS flag can only be changed by users, while the NOCOMPRESS
+	 * flag may be changed automatically if compression code won't make
+	 * things smaller.
+	 */
+	if (flags & FS_NOCOMP_FL) {
+		ip->flags &= ~BTRFS_INODE_COMPRESS;
+		ip->flags |= BTRFS_INODE_NOCOMPRESS;
+	} else if (flags & FS_COMPR_FL) {
+		ip->flags |= BTRFS_INODE_COMPRESS;
+		ip->flags &= ~BTRFS_INODE_NOCOMPRESS;
+	} else {
+		ip->flags &= ~(BTRFS_INODE_COMPRESS | BTRFS_INODE_NOCOMPRESS);
+	}
 
-	trans = btrfs_join_transaction(root, 1);
-	BUG_ON(IS_ERR(trans));
-
-	ret = btrfs_update_inode(trans, root, inode);
-	BUG_ON(ret);
+	trans = btrfs_start_transaction(root, 1);
+	if (IS_ERR(trans)) {
+		ret = PTR_ERR(trans);
+		goto out_drop;
+	}
 
 	btrfs_update_iflags(inode);
+	inode_inc_iversion(inode);
 	inode->i_ctime = CURRENT_TIME;
-	btrfs_end_transaction(trans, root);
+	ret = btrfs_update_inode(trans, root, inode);
 
-	mnt_drop_write(file->f_path.mnt);
+	btrfs_end_transaction(trans, root);
+ out_drop:
+	if (ret) {
+		ip->flags = ip_oldflags;
+		inode->i_flags = i_oldflags;
+	}
+
  out_unlock:
 	mutex_unlock(&inode->i_mutex);
-	return 0;
+	mnt_drop_write_file(file);
+	return ret;
 }
 
 static int btrfs_ioctl_getversion(struct file *file, int __user *arg)
@@ -225,10 +315,59 @@ static int btrfs_ioctl_getversion(struct file *file, int __user *arg)
 	return put_user(inode->i_generation, arg);
 }
 
+static noinline int btrfs_ioctl_fitrim(struct file *file, void __user *arg)
+{
+	struct btrfs_fs_info *fs_info = btrfs_sb(fdentry(file)->d_sb);
+	struct btrfs_device *device;
+	struct request_queue *q;
+	struct fstrim_range range;
+	u64 minlen = ULLONG_MAX;
+	u64 num_devices = 0;
+	u64 total_bytes = btrfs_super_total_bytes(fs_info->super_copy);
+	int ret;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(device, &fs_info->fs_devices->devices,
+				dev_list) {
+		if (!device->bdev)
+			continue;
+		q = bdev_get_queue(device->bdev);
+		if (blk_queue_discard(q)) {
+			num_devices++;
+			minlen = min((u64)q->limits.discard_granularity,
+				     minlen);
+		}
+	}
+	rcu_read_unlock();
+
+	if (!num_devices)
+		return -EOPNOTSUPP;
+	if (copy_from_user(&range, arg, sizeof(range)))
+		return -EFAULT;
+	if (range.start > total_bytes ||
+	    range.len < fs_info->sb->s_blocksize)
+		return -EINVAL;
+
+	range.len = min(range.len, total_bytes - range.start);
+	range.minlen = max(range.minlen, minlen);
+	ret = btrfs_trim_fs(fs_info->tree_root, &range);
+	if (ret < 0)
+		return ret;
+
+	if (copy_to_user(arg, &range, sizeof(range)))
+		return -EFAULT;
+
+	return 0;
+}
+
 static noinline int create_subvol(struct btrfs_root *root,
 				  struct dentry *dentry,
 				  char *name, int namelen,
-				  u64 *async_transid)
+				  u64 *async_transid,
+				  struct btrfs_qgroup_inherit **inherit)
 {
 	struct btrfs_trans_handle *trans;
 	struct btrfs_key key;
@@ -236,20 +375,19 @@ static noinline int create_subvol(struct btrfs_root *root,
 	struct btrfs_inode_item *inode_item;
 	struct extent_buffer *leaf;
 	struct btrfs_root *new_root;
-	struct dentry *parent = dget_parent(dentry);
+	struct dentry *parent = dentry->d_parent;
 	struct inode *dir;
+	struct timespec cur_time = CURRENT_TIME;
 	int ret;
 	int err;
 	u64 objectid;
 	u64 new_dirid = BTRFS_FIRST_FREE_OBJECTID;
 	u64 index = 0;
+	uuid_le new_uuid;
 
-	ret = btrfs_find_free_objectid(NULL, root->fs_info->tree_root,
-				       0, &objectid);
-	if (ret) {
-		dput(parent);
+	ret = btrfs_find_free_objectid(root->fs_info->tree_root, &objectid);
+	if (ret)
 		return ret;
-	}
 
 	dir = parent->d_inode;
 
@@ -260,10 +398,13 @@ static noinline int create_subvol(struct btrfs_root *root,
 	 * 2 - dir items
 	 */
 	trans = btrfs_start_transaction(root, 6);
-	if (IS_ERR(trans)) {
-		dput(parent);
+	if (IS_ERR(trans))
 		return PTR_ERR(trans);
-	}
+
+	ret = btrfs_qgroup_inherit(trans, root->fs_info, 0, objectid,
+				   inherit ? *inherit : NULL);
+	if (ret)
+		goto fail;
 
 	leaf = btrfs_alloc_free_block(trans, root, root->leafsize,
 				      0, objectid, NULL, 0, 0, 0);
@@ -286,8 +427,9 @@ static noinline int create_subvol(struct btrfs_root *root,
 			    BTRFS_UUID_SIZE);
 	btrfs_mark_buffer_dirty(leaf);
 
+	memset(&root_item, 0, sizeof(root_item));
+
 	inode_item = &root_item.inode;
-	memset(inode_item, 0, sizeof(*inode_item));
 	inode_item->generation = cpu_to_le64(1);
 	inode_item->size = cpu_to_le64(3);
 	inode_item->nlink = cpu_to_le32(1);
@@ -305,8 +447,15 @@ static noinline int create_subvol(struct btrfs_root *root,
 	btrfs_set_root_used(&root_item, leaf->len);
 	btrfs_set_root_last_snapshot(&root_item, 0);
 
-	memset(&root_item.drop_progress, 0, sizeof(root_item.drop_progress));
-	root_item.drop_level = 0;
+	btrfs_set_root_generation_v2(&root_item,
+			btrfs_root_generation(&root_item));
+	uuid_le_gen(&new_uuid);
+	memcpy(root_item.uuid, new_uuid.b, BTRFS_UUID_SIZE);
+	root_item.otime.sec = cpu_to_le64(cur_time.tv_sec);
+	root_item.otime.nsec = cpu_to_le32(cur_time.tv_nsec);
+	root_item.ctime = root_item.otime;
+	btrfs_set_root_ctransid(&root_item, trans->transid);
+	btrfs_set_root_otransid(&root_item, trans->transid);
 
 	btrfs_tree_unlock(leaf);
 	free_extent_buffer(leaf);
@@ -324,23 +473,37 @@ static noinline int create_subvol(struct btrfs_root *root,
 
 	key.offset = (u64)-1;
 	new_root = btrfs_read_fs_root_no_name(root->fs_info, &key);
-	BUG_ON(IS_ERR(new_root));
+	if (IS_ERR(new_root)) {
+		btrfs_abort_transaction(trans, root, PTR_ERR(new_root));
+		ret = PTR_ERR(new_root);
+		goto fail;
+	}
 
 	btrfs_record_root_in_trans(trans, new_root);
 
-	ret = btrfs_create_subvol_root(trans, new_root, new_dirid,
-				       BTRFS_I(dir)->block_group);
+	ret = btrfs_create_subvol_root(trans, new_root, new_dirid);
+	if (ret) {
+		/* We potentially lose an unused inode item here */
+		btrfs_abort_transaction(trans, root, ret);
+		goto fail;
+	}
+
 	/*
 	 * insert the directory item
 	 */
 	ret = btrfs_set_inode_index(dir, &index);
-	BUG_ON(ret);
+	if (ret) {
+		btrfs_abort_transaction(trans, root, ret);
+		goto fail;
+	}
 
 	ret = btrfs_insert_dir_item(trans, root,
-				    name, namelen, dir->i_ino, &key,
+				    name, namelen, dir, &key,
 				    BTRFS_FT_DIR, index);
-	if (ret)
+	if (ret) {
+		btrfs_abort_transaction(trans, root, ret);
 		goto fail;
+	}
 
 	btrfs_i_size_write(dir, dir->i_size + namelen * 2);
 	ret = btrfs_update_inode(trans, root, dir);
@@ -348,13 +511,12 @@ static noinline int create_subvol(struct btrfs_root *root,
 
 	ret = btrfs_add_root_ref(trans, root->fs_info->tree_root,
 				 objectid, root->root_key.objectid,
-				 dir->i_ino, index, name, namelen);
+				 btrfs_ino(dir), index, name, namelen);
 
 	BUG_ON(ret);
 
 	d_instantiate(dentry, btrfs_lookup_dentry(dir, dentry));
 fail:
-	dput(parent);
 	if (async_transid) {
 		*async_transid = trans->transid;
 		err = btrfs_commit_transaction_async(trans, root, 1);
@@ -368,10 +530,9 @@ fail:
 
 static int create_snapshot(struct btrfs_root *root, struct dentry *dentry,
 			   char *name, int namelen, u64 *async_transid,
-			   bool readonly)
+			   bool readonly, struct btrfs_qgroup_inherit **inherit)
 {
 	struct inode *inode;
-	struct dentry *parent;
 	struct btrfs_pending_snapshot *pending_snapshot;
 	struct btrfs_trans_handle *trans;
 	int ret;
@@ -383,12 +544,17 @@ static int create_snapshot(struct btrfs_root *root, struct dentry *dentry,
 	if (!pending_snapshot)
 		return -ENOMEM;
 
-	btrfs_init_block_rsv(&pending_snapshot->block_rsv);
+	btrfs_init_block_rsv(&pending_snapshot->block_rsv,
+			     BTRFS_BLOCK_RSV_TEMP);
 	pending_snapshot->dentry = dentry;
 	pending_snapshot->root = root;
 	pending_snapshot->readonly = readonly;
+	if (inherit) {
+		pending_snapshot->inherit = *inherit;
+		*inherit = NULL;	/* take responsibility to free it */
+	}
 
-	trans = btrfs_start_transaction(root->fs_info->extent_root, 5);
+	trans = btrfs_start_transaction(root->fs_info->extent_root, 6);
 	if (IS_ERR(trans)) {
 		ret = PTR_ERR(trans);
 		goto fail;
@@ -397,8 +563,10 @@ static int create_snapshot(struct btrfs_root *root, struct dentry *dentry,
 	ret = btrfs_snap_reserve_metadata(trans, pending_snapshot);
 	BUG_ON(ret);
 
+	spin_lock(&root->fs_info->trans_lock);
 	list_add(&pending_snapshot->list,
 		 &trans->transaction->pending_snapshots);
+	spin_unlock(&root->fs_info->trans_lock);
 	if (async_transid) {
 		*async_transid = trans->transid;
 		ret = btrfs_commit_transaction_async(trans,
@@ -407,17 +575,22 @@ static int create_snapshot(struct btrfs_root *root, struct dentry *dentry,
 		ret = btrfs_commit_transaction(trans,
 					       root->fs_info->extent_root);
 	}
-	BUG_ON(ret);
+	if (ret) {
+		/* cleanup_transaction has freed this for us */
+		if (trans->aborted)
+			pending_snapshot = NULL;
+		goto fail;
+	}
 
 	ret = pending_snapshot->error;
 	if (ret)
 		goto fail;
 
-	btrfs_orphan_cleanup(pending_snapshot->snap);
+	ret = btrfs_orphan_cleanup(pending_snapshot->snap);
+	if (ret)
+		goto fail;
 
-	parent = dget_parent(dentry);
-	inode = btrfs_lookup_dentry(parent->d_inode, dentry);
-	dput(parent);
+	inode = btrfs_lookup_dentry(dentry->d_parent->d_inode, dentry);
 	if (IS_ERR(inode)) {
 		ret = PTR_ERR(inode);
 		goto fail;
@@ -436,13 +609,13 @@ fail:
 */
 static inline int btrfs_check_sticky(struct inode *dir, struct inode *inode)
 {
-	uid_t fsuid = current_fsuid();
+	kuid_t fsuid = current_fsuid();
 
 	if (!(dir->i_mode & S_ISVTX))
 		return 0;
-	if (inode->i_uid == fsuid)
+	if (uid_eq(inode->i_uid, fsuid))
 		return 0;
-	if (dir->i_uid == fsuid)
+	if (uid_eq(dir->i_uid, fsuid))
 		return 0;
 	return !capable(CAP_FOWNER);
 }
@@ -475,7 +648,7 @@ static int btrfs_may_delete(struct inode *dir,struct dentry *victim,int isdir)
 		return -ENOENT;
 
 	BUG_ON(victim->d_parent->d_inode != dir);
-	audit_inode_child(victim, dir);
+	audit_inode_child(dir, victim, AUDIT_TYPE_CHILD_DELETE);
 
 	error = inode_permission(dir, MAY_WRITE | MAY_EXEC);
 	if (error)
@@ -518,7 +691,8 @@ static inline int btrfs_may_create(struct inode *dir, struct dentry *child)
 static noinline int btrfs_mksubvol(struct path *parent,
 				   char *name, int namelen,
 				   struct btrfs_root *snap_src,
-				   u64 *async_transid, bool readonly)
+				   u64 *async_transid, bool readonly,
+				   struct btrfs_qgroup_inherit **inherit)
 {
 	struct inode *dir  = parent->dentry->d_inode;
 	struct dentry *dentry;
@@ -535,13 +709,19 @@ static noinline int btrfs_mksubvol(struct path *parent,
 	if (dentry->d_inode)
 		goto out_dput;
 
-	error = mnt_want_write(parent->mnt);
+	error = btrfs_may_create(dir, dentry);
 	if (error)
 		goto out_dput;
 
-	error = btrfs_may_create(dir, dentry);
+	/*
+	 * even if this name doesn't exist, we may get hash collisions.
+	 * check for them now when we can safely fail
+	 */
+	error = btrfs_check_dir_item_collision(BTRFS_I(dir)->root,
+					       dir->i_ino, name,
+					       namelen);
 	if (error)
-		goto out_drop_write;
+		goto out_dput;
 
 	down_read(&BTRFS_I(dir)->root->fs_info->subvol_sem);
 
@@ -549,18 +729,16 @@ static noinline int btrfs_mksubvol(struct path *parent,
 		goto out_up_read;
 
 	if (snap_src) {
-		error = create_snapshot(snap_src, dentry,
-					name, namelen, async_transid, readonly);
+		error = create_snapshot(snap_src, dentry, name, namelen,
+					async_transid, readonly, inherit);
 	} else {
 		error = create_subvol(BTRFS_I(dir)->root, dentry,
-				      name, namelen, async_transid);
+				      name, namelen, async_transid, inherit);
 	}
 	if (!error)
 		fsnotify_mkdir(dir, dentry);
 out_up_read:
 	up_read(&BTRFS_I(dir)->root->fs_info->subvol_sem);
-out_drop_write:
-	mnt_drop_write(parent->mnt);
 out_dput:
 	dput(dentry);
 out_unlock:
@@ -568,27 +746,113 @@ out_unlock:
 	return error;
 }
 
-static int should_defrag_range(struct inode *inode, u64 start, u64 len,
-			       int thresh, u64 *last_len, u64 *skip,
-			       u64 *defrag_end)
+/*
+ * When we're defragging a range, we don't want to kick it off again
+ * if it is really just waiting for delalloc to send it down.
+ * If we find a nice big extent or delalloc range for the bytes in the
+ * file you want to defrag, we return 0 to let you know to skip this
+ * part of the file
+ */
+static int check_defrag_in_cache(struct inode *inode, u64 offset, int thresh)
 {
 	struct extent_io_tree *io_tree = &BTRFS_I(inode)->io_tree;
 	struct extent_map *em = NULL;
 	struct extent_map_tree *em_tree = &BTRFS_I(inode)->extent_tree;
-	int ret = 1;
+	u64 end;
 
+	read_lock(&em_tree->lock);
+	em = lookup_extent_mapping(em_tree, offset, PAGE_CACHE_SIZE);
+	read_unlock(&em_tree->lock);
 
-	if (thresh == 0)
-		thresh = 256 * 1024;
+	if (em) {
+		end = extent_map_end(em);
+		free_extent_map(em);
+		if (end - offset > thresh)
+			return 0;
+	}
+	/* if we already have a nice delalloc here, just stop */
+	thresh /= 2;
+	end = count_range_bits(io_tree, &offset, offset + thresh,
+			       thresh, EXTENT_DELALLOC, 1);
+	if (end >= thresh)
+		return 0;
+	return 1;
+}
 
-	/*
-	 * make sure that once we start defragging and extent, we keep on
-	 * defragging it
-	 */
-	if (start < *defrag_end)
-		return 1;
+/*
+ * helper function to walk through a file and find extents
+ * newer than a specific transid, and smaller than thresh.
+ *
+ * This is used by the defragging code to find new and small
+ * extents
+ */
+static int find_new_extents(struct btrfs_root *root,
+			    struct inode *inode, u64 newer_than,
+			    u64 *off, int thresh)
+{
+	struct btrfs_path *path;
+	struct btrfs_key min_key;
+	struct btrfs_key max_key;
+	struct extent_buffer *leaf;
+	struct btrfs_file_extent_item *extent;
+	int type;
+	int ret;
+	u64 ino = btrfs_ino(inode);
 
-	*skip = 0;
+	path = btrfs_alloc_path();
+	if (!path)
+		return -ENOMEM;
+
+	min_key.objectid = ino;
+	min_key.type = BTRFS_EXTENT_DATA_KEY;
+	min_key.offset = *off;
+
+	max_key.objectid = ino;
+	max_key.type = (u8)-1;
+	max_key.offset = (u64)-1;
+
+	path->keep_locks = 1;
+
+	while(1) {
+		ret = btrfs_search_forward(root, &min_key, &max_key,
+					   path, 0, newer_than);
+		if (ret != 0)
+			goto none;
+		if (min_key.objectid != ino)
+			goto none;
+		if (min_key.type != BTRFS_EXTENT_DATA_KEY)
+			goto none;
+
+		leaf = path->nodes[0];
+		extent = btrfs_item_ptr(leaf, path->slots[0],
+					struct btrfs_file_extent_item);
+
+		type = btrfs_file_extent_type(leaf, extent);
+		if (type == BTRFS_FILE_EXTENT_REG &&
+		    btrfs_file_extent_num_bytes(leaf, extent) < thresh &&
+		    check_defrag_in_cache(inode, min_key.offset, thresh)) {
+			*off = min_key.offset;
+			btrfs_free_path(path);
+			return 0;
+		}
+
+		if (min_key.offset == (u64)-1)
+			goto none;
+
+		min_key.offset++;
+		btrfs_release_path(path);
+	}
+none:
+	btrfs_free_path(path);
+	return -ENOENT;
+}
+
+static struct extent_map *defrag_lookup_extent(struct inode *inode, u64 start)
+{
+	struct extent_map_tree *em_tree = &BTRFS_I(inode)->extent_tree;
+	struct extent_io_tree *io_tree = &BTRFS_I(inode)->io_tree;
+	struct extent_map *em;
+	u64 len = PAGE_CACHE_SIZE;
 
 	/*
 	 * hopefully we have this extent in the tree already, try without
@@ -600,24 +864,71 @@ static int should_defrag_range(struct inode *inode, u64 start, u64 len,
 
 	if (!em) {
 		/* get the big lock and read metadata off disk */
-		lock_extent(io_tree, start, start + len - 1, GFP_NOFS);
+		lock_extent(io_tree, start, start + len - 1);
 		em = btrfs_get_extent(inode, NULL, 0, start, len, 0);
-		unlock_extent(io_tree, start, start + len - 1, GFP_NOFS);
+		unlock_extent(io_tree, start, start + len - 1);
 
 		if (IS_ERR(em))
-			return 0;
+			return NULL;
 	}
 
-	/* this will cover holes, and inline extents */
-	if (em->block_start >= EXTENT_MAP_LAST_BYTE)
-		ret = 0;
+	return em;
+}
+
+static bool defrag_check_next_extent(struct inode *inode, struct extent_map *em)
+{
+	struct extent_map *next;
+	bool ret = true;
+
+	/* this is the last extent */
+	if (em->start + em->len >= i_size_read(inode))
+		return false;
+
+	next = defrag_lookup_extent(inode, em->start + em->len);
+	if (!next || next->block_start >= EXTENT_MAP_LAST_BYTE)
+		ret = false;
+
+	free_extent_map(next);
+	return ret;
+}
+
+static int should_defrag_range(struct inode *inode, u64 start, int thresh,
+			       u64 *last_len, u64 *skip, u64 *defrag_end,
+			       int compress)
+{
+	struct extent_map *em;
+	int ret = 1;
+	bool next_mergeable = true;
 
 	/*
-	 * we hit a real extent, if it is big don't bother defragging it again
+	 * make sure that once we start defragging an extent, we keep on
+	 * defragging it
 	 */
-	if ((*last_len == 0 || *last_len >= thresh) && em->len >= thresh)
-		ret = 0;
+	if (start < *defrag_end)
+		return 1;
 
+	*skip = 0;
+
+	em = defrag_lookup_extent(inode, start);
+	if (!em)
+		return 0;
+
+	/* this will cover holes, and inline extents */
+	if (em->block_start >= EXTENT_MAP_LAST_BYTE) {
+		ret = 0;
+		goto out;
+	}
+
+	next_mergeable = defrag_check_next_extent(inode, em);
+
+	/*
+	 * we hit a real extent, if it is big or the next extent is not a
+	 * real extent, don't bother defragging it
+	 */
+	if (!compress && (*last_len == 0 || *last_len >= thresh) &&
+	    (em->len >= thresh || !next_mergeable))
+		ret = 0;
+out:
 	/*
 	 * last_len ends up being a counter of how many bytes we've defragged.
 	 * every time we choose not to defrag an extent, we reset *last_len
@@ -627,7 +938,6 @@ static int should_defrag_range(struct inode *inode, u64 start, u64 len,
 	 * extent will force at least part of that big extent to be defragged.
 	 */
 	if (ret) {
-		*last_len += len;
 		*defrag_end = extent_map_end(em);
 	} else {
 		*last_len = 0;
@@ -639,27 +949,186 @@ static int should_defrag_range(struct inode *inode, u64 start, u64 len,
 	return ret;
 }
 
-static int btrfs_defrag_file(struct file *file,
-			     struct btrfs_ioctl_defrag_range_args *range)
+/*
+ * it doesn't do much good to defrag one or two pages
+ * at a time.  This pulls in a nice chunk of pages
+ * to COW and defrag.
+ *
+ * It also makes sure the delalloc code has enough
+ * dirty data to avoid making new small extents as part
+ * of the defrag
+ *
+ * It's a good idea to start RA on this range
+ * before calling this.
+ */
+static int cluster_pages_for_defrag(struct inode *inode,
+				    struct page **pages,
+				    unsigned long start_index,
+				    int num_pages)
 {
-	struct inode *inode = fdentry(file)->d_inode;
-	struct btrfs_root *root = BTRFS_I(inode)->root;
-	struct extent_io_tree *io_tree = &BTRFS_I(inode)->io_tree;
-	struct btrfs_ordered_extent *ordered;
-	struct page *page;
-	struct btrfs_super_block *disk_super;
-	unsigned long last_index;
-	unsigned long ra_pages = root->fs_info->bdi.ra_pages;
-	unsigned long total_read = 0;
-	u64 features;
+	unsigned long file_end;
+	u64 isize = i_size_read(inode);
 	u64 page_start;
 	u64 page_end;
+	u64 page_cnt;
+	int ret;
+	int i;
+	int i_done;
+	struct btrfs_ordered_extent *ordered;
+	struct extent_state *cached_state = NULL;
+	struct extent_io_tree *tree;
+	gfp_t mask = btrfs_alloc_write_mask(inode->i_mapping);
+
+	file_end = (isize - 1) >> PAGE_CACHE_SHIFT;
+	if (!isize || start_index > file_end)
+		return 0;
+
+	page_cnt = min_t(u64, (u64)num_pages, (u64)file_end - start_index + 1);
+
+	ret = btrfs_delalloc_reserve_space(inode,
+					   page_cnt << PAGE_CACHE_SHIFT);
+	if (ret)
+		return ret;
+	i_done = 0;
+	tree = &BTRFS_I(inode)->io_tree;
+
+	/* step one, lock all the pages */
+	for (i = 0; i < page_cnt; i++) {
+		struct page *page;
+again:
+		page = find_or_create_page(inode->i_mapping,
+					   start_index + i, mask);
+		if (!page)
+			break;
+
+		page_start = page_offset(page);
+		page_end = page_start + PAGE_CACHE_SIZE - 1;
+		while (1) {
+			lock_extent(tree, page_start, page_end);
+			ordered = btrfs_lookup_ordered_extent(inode,
+							      page_start);
+			unlock_extent(tree, page_start, page_end);
+			if (!ordered)
+				break;
+
+			unlock_page(page);
+			btrfs_start_ordered_extent(inode, ordered, 1);
+			btrfs_put_ordered_extent(ordered);
+			lock_page(page);
+			/*
+			 * we unlocked the page above, so we need check if
+			 * it was released or not.
+			 */
+			if (page->mapping != inode->i_mapping) {
+				unlock_page(page);
+				page_cache_release(page);
+				goto again;
+			}
+		}
+
+		if (!PageUptodate(page)) {
+			btrfs_readpage(NULL, page);
+			lock_page(page);
+			if (!PageUptodate(page)) {
+				unlock_page(page);
+				page_cache_release(page);
+				ret = -EIO;
+				break;
+			}
+		}
+
+		if (page->mapping != inode->i_mapping) {
+			unlock_page(page);
+			page_cache_release(page);
+			goto again;
+		}
+
+		pages[i] = page;
+		i_done++;
+	}
+	if (!i_done || ret)
+		goto out;
+
+	if (!(inode->i_sb->s_flags & MS_ACTIVE))
+		goto out;
+
+	/*
+	 * so now we have a nice long stream of locked
+	 * and up to date pages, lets wait on them
+	 */
+	for (i = 0; i < i_done; i++)
+		wait_on_page_writeback(pages[i]);
+
+	page_start = page_offset(pages[0]);
+	page_end = page_offset(pages[i_done - 1]) + PAGE_CACHE_SIZE;
+
+	lock_extent_bits(&BTRFS_I(inode)->io_tree,
+			 page_start, page_end - 1, 0, &cached_state);
+	clear_extent_bit(&BTRFS_I(inode)->io_tree, page_start,
+			  page_end - 1, EXTENT_DIRTY | EXTENT_DELALLOC |
+			  EXTENT_DO_ACCOUNTING | EXTENT_DEFRAG, 0, 0,
+			  &cached_state, GFP_NOFS);
+
+	if (i_done != page_cnt) {
+		spin_lock(&BTRFS_I(inode)->lock);
+		BTRFS_I(inode)->outstanding_extents++;
+		spin_unlock(&BTRFS_I(inode)->lock);
+		btrfs_delalloc_release_space(inode,
+				     (page_cnt - i_done) << PAGE_CACHE_SHIFT);
+	}
+
+
+	set_extent_defrag(&BTRFS_I(inode)->io_tree, page_start, page_end - 1,
+			  &cached_state, GFP_NOFS);
+
+	unlock_extent_cached(&BTRFS_I(inode)->io_tree,
+			     page_start, page_end - 1, &cached_state,
+			     GFP_NOFS);
+
+	for (i = 0; i < i_done; i++) {
+		clear_page_dirty_for_io(pages[i]);
+		ClearPageChecked(pages[i]);
+		set_page_extent_mapped(pages[i]);
+		set_page_dirty(pages[i]);
+		unlock_page(pages[i]);
+		page_cache_release(pages[i]);
+	}
+	return i_done;
+out:
+	for (i = 0; i < i_done; i++) {
+		unlock_page(pages[i]);
+		page_cache_release(pages[i]);
+	}
+	btrfs_delalloc_release_space(inode, page_cnt << PAGE_CACHE_SHIFT);
+	return ret;
+
+}
+
+int btrfs_defrag_file(struct inode *inode, struct file *file,
+		      struct btrfs_ioctl_defrag_range_args *range,
+		      u64 newer_than, unsigned long max_to_defrag)
+{
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	struct file_ra_state *ra = NULL;
+	unsigned long last_index;
+	u64 isize = i_size_read(inode);
 	u64 last_len = 0;
 	u64 skip = 0;
 	u64 defrag_end = 0;
+	u64 newer_off = range->start;
 	unsigned long i;
+	unsigned long ra_index = 0;
 	int ret;
+	int defrag_count = 0;
 	int compress_type = BTRFS_COMPRESS_ZLIB;
+	int extent_thresh = range->extent_thresh;
+	int max_cluster = (256 * 1024) >> PAGE_CACHE_SHIFT;
+	int cluster = max_cluster;
+	u64 new_align = ~((u64)128 * 1024 - 1);
+	struct page **pages = NULL;
+
+	if (extent_thresh == 0)
+		extent_thresh = 256 * 1024;
 
 	if (range->flags & BTRFS_DEFRAG_RANGE_COMPRESS) {
 		if (range->compress_type > BTRFS_COMPRESS_TYPES)
@@ -668,23 +1137,76 @@ static int btrfs_defrag_file(struct file *file,
 			compress_type = range->compress_type;
 	}
 
-	if (inode->i_size == 0)
+	if (isize == 0)
 		return 0;
 
-	if (range->start + range->len > range->start) {
-		last_index = min_t(u64, inode->i_size - 1,
-			 range->start + range->len - 1) >> PAGE_CACHE_SHIFT;
+	/*
+	 * if we were not given a file, allocate a readahead
+	 * context
+	 */
+	if (!file) {
+		ra = kzalloc(sizeof(*ra), GFP_NOFS);
+		if (!ra)
+			return -ENOMEM;
+		file_ra_state_init(ra, inode->i_mapping);
 	} else {
-		last_index = (inode->i_size - 1) >> PAGE_CACHE_SHIFT;
+		ra = &file->f_ra;
 	}
 
-	i = range->start >> PAGE_CACHE_SHIFT;
-	while (i <= last_index) {
+	pages = kmalloc(sizeof(struct page *) * max_cluster,
+			GFP_NOFS);
+	if (!pages) {
+		ret = -ENOMEM;
+		goto out_ra;
+	}
+
+	/* find the last page to defrag */
+	if (range->start + range->len > range->start) {
+		last_index = min_t(u64, isize - 1,
+			 range->start + range->len - 1) >> PAGE_CACHE_SHIFT;
+	} else {
+		last_index = (isize - 1) >> PAGE_CACHE_SHIFT;
+	}
+
+	if (newer_than) {
+		ret = find_new_extents(root, inode, newer_than,
+				       &newer_off, 64 * 1024);
+		if (!ret) {
+			range->start = newer_off;
+			/*
+			 * we always align our defrag to help keep
+			 * the extents in the file evenly spaced
+			 */
+			i = (newer_off & new_align) >> PAGE_CACHE_SHIFT;
+		} else
+			goto out_ra;
+	} else {
+		i = range->start >> PAGE_CACHE_SHIFT;
+	}
+	if (!max_to_defrag)
+		max_to_defrag = last_index + 1;
+
+	/*
+	 * make writeback starts from i, so the defrag range can be
+	 * written sequentially.
+	 */
+	if (i < inode->i_mapping->writeback_index)
+		inode->i_mapping->writeback_index = i;
+
+	while (i <= last_index && defrag_count < max_to_defrag &&
+	       (i < (i_size_read(inode) + PAGE_CACHE_SIZE - 1) >>
+		PAGE_CACHE_SHIFT)) {
+		/*
+		 * make sure we stop running if someone unmounts
+		 * the FS
+		 */
+		if (!(inode->i_sb->s_flags & MS_ACTIVE))
+			break;
+
 		if (!should_defrag_range(inode, (u64)i << PAGE_CACHE_SHIFT,
-					PAGE_CACHE_SIZE,
-					range->extent_thresh,
-					&last_len, &skip,
-					&defrag_end)) {
+					 extent_thresh, &last_len, &skip,
+					 &defrag_end, range->flags &
+					 BTRFS_DEFRAG_RANGE_COMPRESS)) {
 			unsigned long next;
 			/*
 			 * the should_defrag function tells us how much to skip
@@ -695,91 +1217,63 @@ static int btrfs_defrag_file(struct file *file,
 			continue;
 		}
 
-		if (total_read % ra_pages == 0) {
-			btrfs_force_ra(inode->i_mapping, &file->f_ra, file, i,
-				       min(last_index, i + ra_pages - 1));
+		if (!newer_than) {
+			cluster = (PAGE_CACHE_ALIGN(defrag_end) >>
+				   PAGE_CACHE_SHIFT) - i;
+			cluster = min(cluster, max_cluster);
+		} else {
+			cluster = max_cluster;
 		}
-		total_read++;
-		mutex_lock(&inode->i_mutex);
+
 		if (range->flags & BTRFS_DEFRAG_RANGE_COMPRESS)
 			BTRFS_I(inode)->force_compress = compress_type;
 
-		ret  = btrfs_delalloc_reserve_space(inode, PAGE_CACHE_SIZE);
-		if (ret)
-			goto err_unlock;
-again:
-		if (inode->i_size == 0 ||
-		    i > ((inode->i_size - 1) >> PAGE_CACHE_SHIFT)) {
-			ret = 0;
-			goto err_reservations;
+		if (i + cluster > ra_index) {
+			ra_index = max(i, ra_index);
+			btrfs_force_ra(inode->i_mapping, ra, file, ra_index,
+				       cluster);
+			ra_index += max_cluster;
 		}
 
-		page = grab_cache_page(inode->i_mapping, i);
-		if (!page) {
-			ret = -ENOMEM;
-			goto err_reservations;
+		mutex_lock(&inode->i_mutex);
+		ret = cluster_pages_for_defrag(inode, pages, i, cluster);
+		if (ret < 0) {
+			mutex_unlock(&inode->i_mutex);
+			goto out_ra;
 		}
 
-		if (!PageUptodate(page)) {
-			btrfs_readpage(NULL, page);
-			lock_page(page);
-			if (!PageUptodate(page)) {
-				unlock_page(page);
-				page_cache_release(page);
-				ret = -EIO;
-				goto err_reservations;
-			}
-		}
-
-		if (page->mapping != inode->i_mapping) {
-			unlock_page(page);
-			page_cache_release(page);
-			goto again;
-		}
-
-		wait_on_page_writeback(page);
-
-		if (PageDirty(page)) {
-			btrfs_delalloc_release_space(inode, PAGE_CACHE_SIZE);
-			goto loop_unlock;
-		}
-
-		page_start = (u64)page->index << PAGE_CACHE_SHIFT;
-		page_end = page_start + PAGE_CACHE_SIZE - 1;
-		lock_extent(io_tree, page_start, page_end, GFP_NOFS);
-
-		ordered = btrfs_lookup_ordered_extent(inode, page_start);
-		if (ordered) {
-			unlock_extent(io_tree, page_start, page_end, GFP_NOFS);
-			unlock_page(page);
-			page_cache_release(page);
-			btrfs_start_ordered_extent(inode, ordered, 1);
-			btrfs_put_ordered_extent(ordered);
-			goto again;
-		}
-		set_page_extent_mapped(page);
-
-		/*
-		 * this makes sure page_mkwrite is called on the
-		 * page if it is dirtied again later
-		 */
-		clear_page_dirty_for_io(page);
-		clear_extent_bits(&BTRFS_I(inode)->io_tree, page_start,
-				  page_end, EXTENT_DIRTY | EXTENT_DELALLOC |
-				  EXTENT_DO_ACCOUNTING, GFP_NOFS);
-
-		btrfs_set_extent_delalloc(inode, page_start, page_end, NULL);
-		ClearPageChecked(page);
-		set_page_dirty(page);
-		unlock_extent(io_tree, page_start, page_end, GFP_NOFS);
-
-loop_unlock:
-		unlock_page(page);
-		page_cache_release(page);
+		defrag_count += ret;
+		balance_dirty_pages_ratelimited(inode->i_mapping);
 		mutex_unlock(&inode->i_mutex);
 
-		balance_dirty_pages_ratelimited_nr(inode->i_mapping, 1);
-		i++;
+		if (newer_than) {
+			if (newer_off == (u64)-1)
+				break;
+
+			if (ret > 0)
+				i += ret;
+
+			newer_off = max(newer_off + 1,
+					(u64)i << PAGE_CACHE_SHIFT);
+
+			ret = find_new_extents(root, inode,
+					       newer_than, &newer_off,
+					       64 * 1024);
+			if (!ret) {
+				range->start = newer_off;
+				i = (newer_off & new_align) >> PAGE_CACHE_SHIFT;
+			} else {
+				break;
+			}
+		} else {
+			if (ret > 0) {
+				i += ret;
+				last_len += ret << PAGE_CACHE_SHIFT;
+			} else {
+				i++;
+				last_len = 0;
+			}
+		}
 	}
 
 	if ((range->flags & BTRFS_DEFRAG_RANGE_START_IO))
@@ -804,28 +1298,26 @@ loop_unlock:
 		mutex_unlock(&inode->i_mutex);
 	}
 
-	disk_super = &root->fs_info->super_copy;
-	features = btrfs_super_incompat_flags(disk_super);
 	if (range->compress_type == BTRFS_COMPRESS_LZO) {
-		features |= BTRFS_FEATURE_INCOMPAT_COMPRESS_LZO;
-		btrfs_set_super_incompat_flags(disk_super, features);
+		btrfs_set_fs_incompat(root->fs_info, COMPRESS_LZO);
 	}
 
-	return 0;
+	ret = defrag_count;
 
-err_reservations:
-	btrfs_delalloc_release_space(inode, PAGE_CACHE_SIZE);
-err_unlock:
-	mutex_unlock(&inode->i_mutex);
+out_ra:
+	if (!file)
+		kfree(ra);
+	kfree(pages);
 	return ret;
 }
 
-static noinline int btrfs_ioctl_resize(struct btrfs_root *root,
+static noinline int btrfs_ioctl_resize(struct file *file,
 					void __user *arg)
 {
 	u64 new_size;
 	u64 old_size;
 	u64 devid = 1;
+	struct btrfs_root *root = BTRFS_I(fdentry(file)->d_inode)->root;
 	struct btrfs_ioctl_vol_args *vol_args;
 	struct btrfs_trans_handle *trans;
 	struct btrfs_device *device = NULL;
@@ -840,13 +1332,26 @@ static noinline int btrfs_ioctl_resize(struct btrfs_root *root,
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
 
+	ret = mnt_want_write_file(file);
+	if (ret)
+		return ret;
+
+	if (atomic_xchg(&root->fs_info->mutually_exclusive_operation_running,
+			1)) {
+		pr_info("btrfs: dev add/delete/balance/replace/resize operation in progress\n");
+		mnt_drop_write_file(file);
+		return -EINVAL;
+	}
+
+	mutex_lock(&root->fs_info->volume_mutex);
 	vol_args = memdup_user(arg, sizeof(*vol_args));
-	if (IS_ERR(vol_args))
-		return PTR_ERR(vol_args);
+	if (IS_ERR(vol_args)) {
+		ret = PTR_ERR(vol_args);
+		goto out;
+	}
 
 	vol_args->name[BTRFS_PATH_NAME_MAX] = '\0';
 
-	mutex_lock(&root->fs_info->volume_mutex);
 	sizestr = vol_args->name;
 	devstr = strchr(sizestr, ':');
 	if (devstr) {
@@ -855,16 +1360,26 @@ static noinline int btrfs_ioctl_resize(struct btrfs_root *root,
 		*devstr = '\0';
 		devstr = vol_args->name;
 		devid = simple_strtoull(devstr, &end, 10);
-		printk(KERN_INFO "resizing devid %llu\n",
+		printk(KERN_INFO "btrfs: resizing devid %llu\n",
 		       (unsigned long long)devid);
 	}
-	device = btrfs_find_device(root, devid, NULL, NULL);
+
+	device = btrfs_find_device(root->fs_info, devid, NULL, NULL);
 	if (!device) {
-		printk(KERN_INFO "resizer unable to find device %llu\n",
+		printk(KERN_INFO "btrfs: resizer unable to find device %llu\n",
 		       (unsigned long long)devid);
 		ret = -EINVAL;
-		goto out_unlock;
+		goto out_free;
 	}
+
+	if (!device->writeable) {
+		printk(KERN_INFO "btrfs: resizer unable to apply on "
+		       "readonly device %llu\n",
+		       (unsigned long long)devid);
+		ret = -EINVAL;
+		goto out_free;
+	}
+
 	if (!strcmp(sizestr, "max"))
 		new_size = device->bdev->bd_inode->i_size;
 	else {
@@ -878,8 +1393,13 @@ static noinline int btrfs_ioctl_resize(struct btrfs_root *root,
 		new_size = memparse(sizestr, NULL);
 		if (new_size == 0) {
 			ret = -EINVAL;
-			goto out_unlock;
+			goto out_free;
 		}
+	}
+
+	if (device->is_tgtdev_for_dev_replace) {
+		ret = -EINVAL;
+		goto out_free;
 	}
 
 	old_size = device->total_bytes;
@@ -887,7 +1407,7 @@ static noinline int btrfs_ioctl_resize(struct btrfs_root *root,
 	if (mod < 0) {
 		if (new_size > old_size) {
 			ret = -EINVAL;
-			goto out_unlock;
+			goto out_free;
 		}
 		new_size = old_size - new_size;
 	} else if (mod > 0) {
@@ -896,82 +1416,90 @@ static noinline int btrfs_ioctl_resize(struct btrfs_root *root,
 
 	if (new_size < 256 * 1024 * 1024) {
 		ret = -EINVAL;
-		goto out_unlock;
+		goto out_free;
 	}
 	if (new_size > device->bdev->bd_inode->i_size) {
 		ret = -EFBIG;
-		goto out_unlock;
+		goto out_free;
 	}
 
 	do_div(new_size, root->sectorsize);
 	new_size *= root->sectorsize;
 
-	printk(KERN_INFO "new size for %s is %llu\n",
-		device->name, (unsigned long long)new_size);
+	printk_in_rcu(KERN_INFO "btrfs: new size for %s is %llu\n",
+		      rcu_str_deref(device->name),
+		      (unsigned long long)new_size);
 
 	if (new_size > old_size) {
 		trans = btrfs_start_transaction(root, 0);
 		if (IS_ERR(trans)) {
 			ret = PTR_ERR(trans);
-			goto out_unlock;
+			goto out_free;
 		}
 		ret = btrfs_grow_device(trans, device, new_size);
 		btrfs_commit_transaction(trans, root);
-	} else {
+	} else if (new_size < old_size) {
 		ret = btrfs_shrink_device(device, new_size);
-	}
+	} /* equal, nothing need to do */
 
-out_unlock:
-	mutex_unlock(&root->fs_info->volume_mutex);
+out_free:
 	kfree(vol_args);
+out:
+	mutex_unlock(&root->fs_info->volume_mutex);
+	atomic_set(&root->fs_info->mutually_exclusive_operation_running, 0);
+	mnt_drop_write_file(file);
 	return ret;
 }
 
 static noinline int btrfs_ioctl_snap_create_transid(struct file *file,
-						    char *name,
-						    unsigned long fd,
-						    int subvol,
-						    u64 *transid,
-						    bool readonly)
+				char *name, unsigned long fd, int subvol,
+				u64 *transid, bool readonly,
+				struct btrfs_qgroup_inherit **inherit)
 {
-	struct btrfs_root *root = BTRFS_I(fdentry(file)->d_inode)->root;
-	struct file *src_file;
 	int namelen;
 	int ret = 0;
 
-	if (root->fs_info->sb->s_flags & MS_RDONLY)
-		return -EROFS;
+	ret = mnt_want_write_file(file);
+	if (ret)
+		goto out;
 
 	namelen = strlen(name);
 	if (strchr(name, '/')) {
 		ret = -EINVAL;
-		goto out;
+		goto out_drop_write;
+	}
+
+	if (name[0] == '.' &&
+	   (namelen == 1 || (name[1] == '.' && namelen == 2))) {
+		ret = -EEXIST;
+		goto out_drop_write;
 	}
 
 	if (subvol) {
 		ret = btrfs_mksubvol(&file->f_path, name, namelen,
-				     NULL, transid, readonly);
+				     NULL, transid, readonly, inherit);
 	} else {
+		struct fd src = fdget(fd);
 		struct inode *src_inode;
-		src_file = fget(fd);
-		if (!src_file) {
+		if (!src.file) {
 			ret = -EINVAL;
-			goto out;
+			goto out_drop_write;
 		}
 
-		src_inode = src_file->f_path.dentry->d_inode;
+		src_inode = src.file->f_path.dentry->d_inode;
 		if (src_inode->i_sb != file->f_path.dentry->d_inode->i_sb) {
 			printk(KERN_INFO "btrfs: Snapshot src from "
 			       "another FS\n");
 			ret = -EINVAL;
-			fput(src_file);
-			goto out;
+		} else {
+			ret = btrfs_mksubvol(&file->f_path, name, namelen,
+					     BTRFS_I(src_inode)->root,
+					     transid, readonly, inherit);
 		}
-		ret = btrfs_mksubvol(&file->f_path, name, namelen,
-				     BTRFS_I(src_inode)->root,
-				     transid, readonly);
-		fput(src_file);
+		fdput(src);
 	}
+out_drop_write:
+	mnt_drop_write_file(file);
 out:
 	return ret;
 }
@@ -989,7 +1517,7 @@ static noinline int btrfs_ioctl_snap_create(struct file *file,
 
 	ret = btrfs_ioctl_snap_create_transid(file, vol_args->name,
 					      vol_args->fd, subvol,
-					      NULL, false);
+					      NULL, false, NULL);
 
 	kfree(vol_args);
 	return ret;
@@ -1003,6 +1531,7 @@ static noinline int btrfs_ioctl_snap_create_v2(struct file *file,
 	u64 transid = 0;
 	u64 *ptr = NULL;
 	bool readonly = false;
+	struct btrfs_qgroup_inherit *inherit = NULL;
 
 	vol_args = memdup_user(arg, sizeof(*vol_args));
 	if (IS_ERR(vol_args))
@@ -1010,7 +1539,8 @@ static noinline int btrfs_ioctl_snap_create_v2(struct file *file,
 	vol_args->name[BTRFS_SUBVOL_NAME_MAX] = '\0';
 
 	if (vol_args->flags &
-	    ~(BTRFS_SUBVOL_CREATE_ASYNC | BTRFS_SUBVOL_RDONLY)) {
+	    ~(BTRFS_SUBVOL_CREATE_ASYNC | BTRFS_SUBVOL_RDONLY |
+	      BTRFS_SUBVOL_QGROUP_INHERIT)) {
 		ret = -EOPNOTSUPP;
 		goto out;
 	}
@@ -1019,10 +1549,21 @@ static noinline int btrfs_ioctl_snap_create_v2(struct file *file,
 		ptr = &transid;
 	if (vol_args->flags & BTRFS_SUBVOL_RDONLY)
 		readonly = true;
+	if (vol_args->flags & BTRFS_SUBVOL_QGROUP_INHERIT) {
+		if (vol_args->size > PAGE_CACHE_SIZE) {
+			ret = -EINVAL;
+			goto out;
+		}
+		inherit = memdup_user(vol_args->qgroup_inherit, vol_args->size);
+		if (IS_ERR(inherit)) {
+			ret = PTR_ERR(inherit);
+			goto out;
+		}
+	}
 
 	ret = btrfs_ioctl_snap_create_transid(file, vol_args->name,
-					      vol_args->fd, subvol,
-					      ptr, readonly);
+					      vol_args->fd, subvol, ptr,
+					      readonly, &inherit);
 
 	if (ret == 0 && ptr &&
 	    copy_to_user(arg +
@@ -1031,6 +1572,7 @@ static noinline int btrfs_ioctl_snap_create_v2(struct file *file,
 		ret = -EFAULT;
 out:
 	kfree(vol_args);
+	kfree(inherit);
 	return ret;
 }
 
@@ -1042,7 +1584,7 @@ static noinline int btrfs_ioctl_subvol_getflags(struct file *file,
 	int ret = 0;
 	u64 flags = 0;
 
-	if (inode->i_ino != BTRFS_FIRST_FREE_OBJECTID)
+	if (btrfs_ino(inode) != BTRFS_FIRST_FREE_OBJECTID)
 		return -EINVAL;
 
 	down_read(&root->fs_info->subvol_sem);
@@ -1066,29 +1608,40 @@ static noinline int btrfs_ioctl_subvol_setflags(struct file *file,
 	u64 flags;
 	int ret = 0;
 
-	if (root->fs_info->sb->s_flags & MS_RDONLY)
-		return -EROFS;
+	ret = mnt_want_write_file(file);
+	if (ret)
+		goto out;
 
-	if (inode->i_ino != BTRFS_FIRST_FREE_OBJECTID)
-		return -EINVAL;
+	if (btrfs_ino(inode) != BTRFS_FIRST_FREE_OBJECTID) {
+		ret = -EINVAL;
+		goto out_drop_write;
+	}
 
-	if (copy_from_user(&flags, arg, sizeof(flags)))
-		return -EFAULT;
+	if (copy_from_user(&flags, arg, sizeof(flags))) {
+		ret = -EFAULT;
+		goto out_drop_write;
+	}
 
-	if (flags & BTRFS_SUBVOL_CREATE_ASYNC)
-		return -EINVAL;
+	if (flags & BTRFS_SUBVOL_CREATE_ASYNC) {
+		ret = -EINVAL;
+		goto out_drop_write;
+	}
 
-	if (flags & ~BTRFS_SUBVOL_RDONLY)
-		return -EOPNOTSUPP;
+	if (flags & ~BTRFS_SUBVOL_RDONLY) {
+		ret = -EOPNOTSUPP;
+		goto out_drop_write;
+	}
 
-	if (!is_owner_or_cap(inode))
-		return -EACCES;
+	if (!inode_owner_or_capable(inode)) {
+		ret = -EACCES;
+		goto out_drop_write;
+	}
 
 	down_write(&root->fs_info->subvol_sem);
 
 	/* nothing to do */
 	if (!!(flags & BTRFS_SUBVOL_RDONLY) == btrfs_root_readonly(root))
-		goto out;
+		goto out_drop_sem;
 
 	root_flags = btrfs_root_flags(&root->root_item);
 	if (flags & BTRFS_SUBVOL_RDONLY)
@@ -1111,8 +1664,11 @@ static noinline int btrfs_ioctl_subvol_setflags(struct file *file,
 out_reset:
 	if (ret)
 		btrfs_set_root_flags(&root->root_item, root_flags);
-out:
+out_drop_sem:
 	up_write(&root->fs_info->subvol_sem);
+out_drop_write:
+	mnt_drop_write_file(file);
+out:
 	return ret;
 }
 
@@ -1192,7 +1748,6 @@ static noinline int copy_to_sk(struct btrfs_root *root,
 	int nritems;
 	int i;
 	int slot;
-	int found = 0;
 	int ret = 0;
 
 	leaf = path->nodes[0];
@@ -1239,7 +1794,7 @@ static noinline int copy_to_sk(struct btrfs_root *root,
 					   item_off, item_len);
 			*sk_offset += item_len;
 		}
-		found++;
+		(*num_found)++;
 
 		if (*num_found >= sk->nr_items)
 			break;
@@ -1258,7 +1813,6 @@ advance_key:
 	} else
 		ret = 1;
 overflow:
-	*num_found += found;
 	return ret;
 }
 
@@ -1315,7 +1869,7 @@ static noinline int search_ioctl(struct inode *inode,
 		}
 		ret = copy_to_sk(root, path, &key, sk, args->buf,
 				 &sk_offset, &num_found);
-		btrfs_release_path(root, path);
+		btrfs_release_path(path);
 		if (ret || num_found >= sk->nr_items)
 			break;
 
@@ -1422,15 +1976,14 @@ static noinline int btrfs_search_path_in_tree(struct btrfs_fs_info *info,
 		if (key.offset == BTRFS_FIRST_FREE_OBJECTID)
 			break;
 
-		btrfs_release_path(root, path);
+		btrfs_release_path(path);
 		key.objectid = key.offset;
 		key.offset = (u64)-1;
 		dirid = key.objectid;
-
 	}
 	if (ptr < name)
 		goto out;
-	memcpy(name, ptr, total_len);
+	memmove(name, ptr, total_len);
 	name[total_len]='\0';
 	ret = 0;
 out:
@@ -1495,7 +2048,7 @@ static noinline int btrfs_ioctl_snap_destroy(struct file *file,
 		goto out;
 	}
 
-	err = mnt_want_write(file->f_path.mnt);
+	err = mnt_want_write_file(file);
 	if (err)
 		goto out;
 
@@ -1545,14 +2098,14 @@ static noinline int btrfs_ioctl_snap_destroy(struct file *file,
 		err = inode_permission(inode, MAY_WRITE | MAY_EXEC);
 		if (err)
 			goto out_dput;
-
-		/* check if subvolume may be deleted by a non-root user */
-		err = btrfs_may_delete(dir, dentry, 1);
-		if (err)
-			goto out_dput;
 	}
 
-	if (inode->i_ino != BTRFS_FIRST_FREE_OBJECTID) {
+	/* check if subvolume may be deleted by a user */
+	err = btrfs_may_delete(dir, dentry, 1);
+	if (err)
+		goto out_dput;
+
+	if (btrfs_ino(inode) != BTRFS_FIRST_FREE_OBJECTID) {
 		err = -EINVAL;
 		goto out_dput;
 	}
@@ -1579,7 +2132,11 @@ static noinline int btrfs_ioctl_snap_destroy(struct file *file,
 				dest->root_key.objectid,
 				dentry->d_name.name,
 				dentry->d_name.len);
-	BUG_ON(ret);
+	if (ret) {
+		err = ret;
+		btrfs_abort_transaction(trans, root, ret);
+		goto out_end_trans;
+	}
 
 	btrfs_record_root_in_trans(trans, dest);
 
@@ -1592,11 +2149,16 @@ static noinline int btrfs_ioctl_snap_destroy(struct file *file,
 		ret = btrfs_insert_orphan_item(trans,
 					root->fs_info->tree_root,
 					dest->root_key.objectid);
-		BUG_ON(ret);
+		if (ret) {
+			btrfs_abort_transaction(trans, root, ret);
+			err = ret;
+			goto out_end_trans;
+		}
 	}
-
+out_end_trans:
 	ret = btrfs_end_transaction(trans, root);
-	BUG_ON(ret);
+	if (ret && !err)
+		err = ret;
 	inode->i_flags |= S_DEAD;
 out_up_write:
 	up_write(&root->fs_info->subvol_sem);
@@ -1611,7 +2173,7 @@ out_dput:
 	dput(dentry);
 out_unlock_dir:
 	mutex_unlock(&dir->i_mutex);
-	mnt_drop_write(file->f_path.mnt);
+	mnt_drop_write_file(file);
 out:
 	kfree(vol_args);
 	return err;
@@ -1624,12 +2186,21 @@ static int btrfs_ioctl_defrag(struct file *file, void __user *argp)
 	struct btrfs_ioctl_defrag_range_args *range;
 	int ret;
 
-	if (btrfs_root_readonly(root))
-		return -EROFS;
-
-	ret = mnt_want_write(file->f_path.mnt);
+	ret = mnt_want_write_file(file);
 	if (ret)
 		return ret;
+
+	if (atomic_xchg(&root->fs_info->mutually_exclusive_operation_running,
+			1)) {
+		pr_info("btrfs: dev add/delete/balance/replace/resize operation in progress\n");
+		mnt_drop_write_file(file);
+		return -EINVAL;
+	}
+
+	if (btrfs_root_readonly(root)) {
+		ret = -EROFS;
+		goto out;
+	}
 
 	switch (inode->i_mode & S_IFMT) {
 	case S_IFDIR:
@@ -1670,14 +2241,18 @@ static int btrfs_ioctl_defrag(struct file *file, void __user *argp)
 			/* the rest are all set to zero by kzalloc */
 			range->len = (u64)-1;
 		}
-		ret = btrfs_defrag_file(file, range);
+		ret = btrfs_defrag_file(fdentry(file)->d_inode, file,
+					range, 0, 0);
+		if (ret > 0)
+			ret = 0;
 		kfree(range);
 		break;
 	default:
 		ret = -EINVAL;
 	}
 out:
-	mnt_drop_write(file->f_path.mnt);
+	atomic_set(&root->fs_info->mutually_exclusive_operation_running, 0);
+	mnt_drop_write_file(file);
 	return ret;
 }
 
@@ -1689,36 +2264,148 @@ static long btrfs_ioctl_add_dev(struct btrfs_root *root, void __user *arg)
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
 
+	if (atomic_xchg(&root->fs_info->mutually_exclusive_operation_running,
+			1)) {
+		pr_info("btrfs: dev add/delete/balance/replace/resize operation in progress\n");
+		return -EINVAL;
+	}
+
+	mutex_lock(&root->fs_info->volume_mutex);
 	vol_args = memdup_user(arg, sizeof(*vol_args));
-	if (IS_ERR(vol_args))
-		return PTR_ERR(vol_args);
+	if (IS_ERR(vol_args)) {
+		ret = PTR_ERR(vol_args);
+		goto out;
+	}
 
 	vol_args->name[BTRFS_PATH_NAME_MAX] = '\0';
 	ret = btrfs_init_new_device(root, vol_args->name);
 
 	kfree(vol_args);
+out:
+	mutex_unlock(&root->fs_info->volume_mutex);
+	atomic_set(&root->fs_info->mutually_exclusive_operation_running, 0);
 	return ret;
 }
 
-static long btrfs_ioctl_rm_dev(struct btrfs_root *root, void __user *arg)
+static long btrfs_ioctl_rm_dev(struct file *file, void __user *arg)
 {
+	struct btrfs_root *root = BTRFS_I(fdentry(file)->d_inode)->root;
 	struct btrfs_ioctl_vol_args *vol_args;
 	int ret;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
 
-	if (root->fs_info->sb->s_flags & MS_RDONLY)
-		return -EROFS;
+	ret = mnt_want_write_file(file);
+	if (ret)
+		return ret;
 
+	if (atomic_xchg(&root->fs_info->mutually_exclusive_operation_running,
+			1)) {
+		pr_info("btrfs: dev add/delete/balance/replace/resize operation in progress\n");
+		mnt_drop_write_file(file);
+		return -EINVAL;
+	}
+
+	mutex_lock(&root->fs_info->volume_mutex);
 	vol_args = memdup_user(arg, sizeof(*vol_args));
-	if (IS_ERR(vol_args))
-		return PTR_ERR(vol_args);
+	if (IS_ERR(vol_args)) {
+		ret = PTR_ERR(vol_args);
+		goto out;
+	}
 
 	vol_args->name[BTRFS_PATH_NAME_MAX] = '\0';
 	ret = btrfs_rm_device(root, vol_args->name);
 
 	kfree(vol_args);
+out:
+	mutex_unlock(&root->fs_info->volume_mutex);
+	atomic_set(&root->fs_info->mutually_exclusive_operation_running, 0);
+	mnt_drop_write_file(file);
+	return ret;
+}
+
+static long btrfs_ioctl_fs_info(struct btrfs_root *root, void __user *arg)
+{
+	struct btrfs_ioctl_fs_info_args *fi_args;
+	struct btrfs_device *device;
+	struct btrfs_device *next;
+	struct btrfs_fs_devices *fs_devices = root->fs_info->fs_devices;
+	int ret = 0;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	fi_args = kzalloc(sizeof(*fi_args), GFP_KERNEL);
+	if (!fi_args)
+		return -ENOMEM;
+
+	fi_args->num_devices = fs_devices->num_devices;
+	memcpy(&fi_args->fsid, root->fs_info->fsid, sizeof(fi_args->fsid));
+
+	mutex_lock(&fs_devices->device_list_mutex);
+	list_for_each_entry_safe(device, next, &fs_devices->devices, dev_list) {
+		if (device->devid > fi_args->max_id)
+			fi_args->max_id = device->devid;
+	}
+	mutex_unlock(&fs_devices->device_list_mutex);
+
+	if (copy_to_user(arg, fi_args, sizeof(*fi_args)))
+		ret = -EFAULT;
+
+	kfree(fi_args);
+	return ret;
+}
+
+static long btrfs_ioctl_dev_info(struct btrfs_root *root, void __user *arg)
+{
+	struct btrfs_ioctl_dev_info_args *di_args;
+	struct btrfs_device *dev;
+	struct btrfs_fs_devices *fs_devices = root->fs_info->fs_devices;
+	int ret = 0;
+	char *s_uuid = NULL;
+	char empty_uuid[BTRFS_UUID_SIZE] = {0};
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	di_args = memdup_user(arg, sizeof(*di_args));
+	if (IS_ERR(di_args))
+		return PTR_ERR(di_args);
+
+	if (memcmp(empty_uuid, di_args->uuid, BTRFS_UUID_SIZE) != 0)
+		s_uuid = di_args->uuid;
+
+	mutex_lock(&fs_devices->device_list_mutex);
+	dev = btrfs_find_device(root->fs_info, di_args->devid, s_uuid, NULL);
+	mutex_unlock(&fs_devices->device_list_mutex);
+
+	if (!dev) {
+		ret = -ENODEV;
+		goto out;
+	}
+
+	di_args->devid = dev->devid;
+	di_args->bytes_used = dev->bytes_used;
+	di_args->total_bytes = dev->total_bytes;
+	memcpy(di_args->uuid, dev->uuid, sizeof(di_args->uuid));
+	if (dev->name) {
+		struct rcu_string *name;
+
+		rcu_read_lock();
+		name = rcu_dereference(dev->name);
+		strncpy(di_args->path, name->str, sizeof(di_args->path));
+		rcu_read_unlock();
+		di_args->path[sizeof(di_args->path) - 1] = 0;
+	} else {
+		di_args->path[0] = '\0';
+	}
+
+out:
+	if (ret == 0 && copy_to_user(arg, di_args, sizeof(*di_args)))
+		ret = -EFAULT;
+
+	kfree(di_args);
 	return ret;
 }
 
@@ -1727,7 +2414,7 @@ static noinline long btrfs_ioctl_clone(struct file *file, unsigned long srcfd,
 {
 	struct inode *inode = fdentry(file)->d_inode;
 	struct btrfs_root *root = BTRFS_I(inode)->root;
-	struct file *src_file;
+	struct fd src_file;
 	struct inode *src;
 	struct btrfs_trans_handle *trans;
 	struct btrfs_path *path;
@@ -1739,7 +2426,6 @@ static noinline long btrfs_ioctl_clone(struct file *file, unsigned long srcfd,
 	int ret;
 	u64 len = olen;
 	u64 bs = root->fs_info->sb->s_blocksize;
-	u64 hint_byte;
 
 	/*
 	 * TODO:
@@ -1758,24 +2444,33 @@ static noinline long btrfs_ioctl_clone(struct file *file, unsigned long srcfd,
 	if (btrfs_root_readonly(root))
 		return -EROFS;
 
-	ret = mnt_want_write(file->f_path.mnt);
+	ret = mnt_want_write_file(file);
 	if (ret)
 		return ret;
 
-	src_file = fget(srcfd);
-	if (!src_file) {
+	src_file = fdget(srcfd);
+	if (!src_file.file) {
 		ret = -EBADF;
 		goto out_drop_write;
 	}
 
-	src = src_file->f_dentry->d_inode;
+	ret = -EXDEV;
+	if (src_file.file->f_path.mnt != file->f_path.mnt)
+		goto out_fput;
+
+	src = src_file.file->f_dentry->d_inode;
 
 	ret = -EINVAL;
 	if (src == inode)
 		goto out_fput;
 
 	/* the src must be open for reading */
-	if (!(src_file->f_mode & FMODE_READ))
+	if (!(src_file.file->f_mode & FMODE_READ))
+		goto out_fput;
+
+	/* don't make the dst file partly checksummed */
+	if ((BTRFS_I(src)->flags & BTRFS_INODE_NODATASUM) !=
+	    (BTRFS_I(inode)->flags & BTRFS_INODE_NODATASUM))
 		goto out_fput;
 
 	ret = -EISDIR;
@@ -1783,7 +2478,7 @@ static noinline long btrfs_ioctl_clone(struct file *file, unsigned long srcfd,
 		goto out_fput;
 
 	ret = -EXDEV;
-	if (src->i_sb != inode->i_sb || BTRFS_I(src)->root != root)
+	if (src->i_sb != inode->i_sb)
 		goto out_fput;
 
 	ret = -ENOMEM;
@@ -1821,24 +2516,34 @@ static noinline long btrfs_ioctl_clone(struct file *file, unsigned long srcfd,
 	    !IS_ALIGNED(destoff, bs))
 		goto out_unlock;
 
+	if (destoff > inode->i_size) {
+		ret = btrfs_cont_expand(inode, inode->i_size, destoff);
+		if (ret)
+			goto out_unlock;
+	}
+
+	/* truncate page cache pages from target inode range */
+	truncate_inode_pages_range(&inode->i_data, destoff,
+				   PAGE_CACHE_ALIGN(destoff + len) - 1);
+
 	/* do any pending delalloc/csum calc on src, one way or
 	   another, and lock file content */
 	while (1) {
 		struct btrfs_ordered_extent *ordered;
-		lock_extent(&BTRFS_I(src)->io_tree, off, off+len, GFP_NOFS);
-		ordered = btrfs_lookup_first_ordered_extent(src, off+len);
+		lock_extent(&BTRFS_I(src)->io_tree, off, off + len - 1);
+		ordered = btrfs_lookup_first_ordered_extent(src, off + len - 1);
 		if (!ordered &&
-		    !test_range_bit(&BTRFS_I(src)->io_tree, off, off+len,
-				   EXTENT_DELALLOC, 0, NULL))
+		    !test_range_bit(&BTRFS_I(src)->io_tree, off, off + len - 1,
+				    EXTENT_DELALLOC, 0, NULL))
 			break;
-		unlock_extent(&BTRFS_I(src)->io_tree, off, off+len, GFP_NOFS);
+		unlock_extent(&BTRFS_I(src)->io_tree, off, off + len - 1);
 		if (ordered)
 			btrfs_put_ordered_extent(ordered);
 		btrfs_wait_ordered_range(src, off, len);
 	}
 
 	/* clone data */
-	key.objectid = src->i_ino;
+	key.objectid = btrfs_ino(src);
 	key.type = BTRFS_EXTENT_DATA_KEY;
 	key.offset = 0;
 
@@ -1847,13 +2552,14 @@ static noinline long btrfs_ioctl_clone(struct file *file, unsigned long srcfd,
 		 * note the key will change type as we walk through the
 		 * tree.
 		 */
-		ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
+		ret = btrfs_search_slot(NULL, BTRFS_I(src)->root, &key, path,
+				0, 0);
 		if (ret < 0)
 			goto out;
 
 		nritems = btrfs_header_nritems(path->nodes[0]);
 		if (path->slots[0] >= nritems) {
-			ret = btrfs_next_leaf(root, path);
+			ret = btrfs_next_leaf(BTRFS_I(src)->root, path);
 			if (ret < 0)
 				goto out;
 			if (ret > 0)
@@ -1865,7 +2571,7 @@ static noinline long btrfs_ioctl_clone(struct file *file, unsigned long srcfd,
 
 		btrfs_item_key_to_cpu(leaf, &key, slot);
 		if (btrfs_key_type(&key) > BTRFS_EXTENT_DATA_KEY ||
-		    key.objectid != src->i_ino)
+		    key.objectid != btrfs_ino(src))
 			break;
 
 		if (btrfs_key_type(&key) == BTRFS_EXTENT_DATA_KEY) {
@@ -1901,20 +2607,25 @@ static noinline long btrfs_ioctl_clone(struct file *file, unsigned long srcfd,
 				datal = btrfs_file_extent_ram_bytes(leaf,
 								    extent);
 			}
-			btrfs_release_path(root, path);
+			btrfs_release_path(path);
 
 			if (key.offset + datal <= off ||
-			    key.offset >= off+len)
+			    key.offset >= off + len - 1)
 				goto next;
 
 			memcpy(&new_key, &key, sizeof(new_key));
-			new_key.objectid = inode->i_ino;
+			new_key.objectid = btrfs_ino(inode);
 			if (off <= key.offset)
 				new_key.offset = key.offset + destoff - off;
 			else
 				new_key.offset = destoff;
 
-			trans = btrfs_start_transaction(root, 1);
+			/*
+			 * 1 - adjusting old extent (we may have to split it)
+			 * 1 - add new extent
+			 * 1 - inode update
+			 */
+			trans = btrfs_start_transaction(root, 3);
 			if (IS_ERR(trans)) {
 				ret = PTR_ERR(trans);
 				goto out;
@@ -1922,23 +2633,40 @@ static noinline long btrfs_ioctl_clone(struct file *file, unsigned long srcfd,
 
 			if (type == BTRFS_FILE_EXTENT_REG ||
 			    type == BTRFS_FILE_EXTENT_PREALLOC) {
+				/*
+				 *    a  | --- range to clone ---|  b
+				 * | ------------- extent ------------- |
+				 */
+
+				/* substract range b */
+				if (key.offset + datal > off + len)
+					datal = off + len - key.offset;
+
+				/* substract range a */
 				if (off > key.offset) {
 					datao += off - key.offset;
 					datal -= off - key.offset;
 				}
 
-				if (key.offset + datal > off + len)
-					datal = off + len - key.offset;
-
-				ret = btrfs_drop_extents(trans, inode,
+				ret = btrfs_drop_extents(trans, root, inode,
 							 new_key.offset,
 							 new_key.offset + datal,
-							 &hint_byte, 1);
-				BUG_ON(ret);
+							 1);
+				if (ret) {
+					btrfs_abort_transaction(trans, root,
+								ret);
+					btrfs_end_transaction(trans, root);
+					goto out;
+				}
 
 				ret = btrfs_insert_empty_item(trans, root, path,
 							      &new_key, size);
-				BUG_ON(ret);
+				if (ret) {
+					btrfs_abort_transaction(trans, root,
+								ret);
+					btrfs_end_transaction(trans, root);
+					goto out;
+				}
 
 				leaf = path->nodes[0];
 				slot = path->slots[0];
@@ -1962,9 +2690,18 @@ static noinline long btrfs_ioctl_clone(struct file *file, unsigned long srcfd,
 					ret = btrfs_inc_extent_ref(trans, root,
 							disko, diskl, 0,
 							root->root_key.objectid,
-							inode->i_ino,
-							new_key.offset - datao);
-					BUG_ON(ret);
+							btrfs_ino(inode),
+							new_key.offset - datao,
+							0);
+					if (ret) {
+						btrfs_abort_transaction(trans,
+									root,
+									ret);
+						btrfs_end_transaction(trans,
+								      root);
+						goto out;
+
+					}
 				}
 			} else if (type == BTRFS_FILE_EXTENT_INLINE) {
 				u64 skip = 0;
@@ -1974,8 +2711,8 @@ static noinline long btrfs_ioctl_clone(struct file *file, unsigned long srcfd,
 					new_key.offset += skip;
 				}
 
-				if (key.offset + datal > off+len)
-					trim = key.offset + datal - (off+len);
+				if (key.offset + datal > off + len)
+					trim = key.offset + datal - (off + len);
 
 				if (comp && (skip || trim)) {
 					ret = -EINVAL;
@@ -1985,15 +2722,25 @@ static noinline long btrfs_ioctl_clone(struct file *file, unsigned long srcfd,
 				size -= skip + trim;
 				datal -= skip + trim;
 
-				ret = btrfs_drop_extents(trans, inode,
+				ret = btrfs_drop_extents(trans, root, inode,
 							 new_key.offset,
 							 new_key.offset + datal,
-							 &hint_byte, 1);
-				BUG_ON(ret);
+							 1);
+				if (ret) {
+					btrfs_abort_transaction(trans, root,
+								ret);
+					btrfs_end_transaction(trans, root);
+					goto out;
+				}
 
 				ret = btrfs_insert_empty_item(trans, root, path,
 							      &new_key, size);
-				BUG_ON(ret);
+				if (ret) {
+					btrfs_abort_transaction(trans, root,
+								ret);
+					btrfs_end_transaction(trans, root);
+					goto out;
+				}
 
 				if (skip) {
 					u32 start =
@@ -2011,8 +2758,9 @@ static noinline long btrfs_ioctl_clone(struct file *file, unsigned long srcfd,
 			}
 
 			btrfs_mark_buffer_dirty(leaf);
-			btrfs_release_path(root, path);
+			btrfs_release_path(path);
 
+			inode_inc_iversion(inode);
 			inode->i_mtime = inode->i_ctime = CURRENT_TIME;
 
 			/*
@@ -2026,28 +2774,31 @@ static noinline long btrfs_ioctl_clone(struct file *file, unsigned long srcfd,
 			if (endoff > inode->i_size)
 				btrfs_i_size_write(inode, endoff);
 
-			BTRFS_I(inode)->flags = BTRFS_I(src)->flags;
 			ret = btrfs_update_inode(trans, root, inode);
-			BUG_ON(ret);
-			btrfs_end_transaction(trans, root);
+			if (ret) {
+				btrfs_abort_transaction(trans, root, ret);
+				btrfs_end_transaction(trans, root);
+				goto out;
+			}
+			ret = btrfs_end_transaction(trans, root);
 		}
 next:
-		btrfs_release_path(root, path);
+		btrfs_release_path(path);
 		key.offset++;
 	}
 	ret = 0;
 out:
-	btrfs_release_path(root, path);
-	unlock_extent(&BTRFS_I(src)->io_tree, off, off+len, GFP_NOFS);
+	btrfs_release_path(path);
+	unlock_extent(&BTRFS_I(src)->io_tree, off, off + len - 1);
 out_unlock:
 	mutex_unlock(&src->i_mutex);
 	mutex_unlock(&inode->i_mutex);
 	vfree(buf);
 	btrfs_free_path(path);
 out_fput:
-	fput(src_file);
+	fdput(src_file);
 out_drop_write:
-	mnt_drop_write(file->f_path.mnt);
+	mnt_drop_write_file(file);
 	return ret;
 }
 
@@ -2086,16 +2837,14 @@ static long btrfs_ioctl_trans_start(struct file *file)
 	if (btrfs_root_readonly(root))
 		goto out;
 
-	ret = mnt_want_write(file->f_path.mnt);
+	ret = mnt_want_write_file(file);
 	if (ret)
 		goto out;
 
-	mutex_lock(&root->fs_info->trans_mutex);
-	root->fs_info->open_ioctl_trans++;
-	mutex_unlock(&root->fs_info->trans_mutex);
+	atomic_inc(&root->fs_info->open_ioctl_trans);
 
 	ret = -ENOMEM;
-	trans = btrfs_start_ioctl_transaction(root, 0);
+	trans = btrfs_start_ioctl_transaction(root);
 	if (IS_ERR(trans))
 		goto out_drop;
 
@@ -2103,10 +2852,8 @@ static long btrfs_ioctl_trans_start(struct file *file)
 	return 0;
 
 out_drop:
-	mutex_lock(&root->fs_info->trans_mutex);
-	root->fs_info->open_ioctl_trans--;
-	mutex_unlock(&root->fs_info->trans_mutex);
-	mnt_drop_write(file->f_path.mnt);
+	atomic_dec(&root->fs_info->open_ioctl_trans);
+	mnt_drop_write_file(file);
 out:
 	return ret;
 }
@@ -2121,16 +2868,21 @@ static long btrfs_ioctl_default_subvol(struct file *file, void __user *argp)
 	struct btrfs_path *path;
 	struct btrfs_key location;
 	struct btrfs_disk_key disk_key;
-	struct btrfs_super_block *disk_super;
-	u64 features;
 	u64 objectid = 0;
 	u64 dir_id;
+	int ret;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
 
-	if (copy_from_user(&objectid, argp, sizeof(objectid)))
-		return -EFAULT;
+	ret = mnt_want_write_file(file);
+	if (ret)
+		return ret;
+
+	if (copy_from_user(&objectid, argp, sizeof(objectid))) {
+		ret = -EFAULT;
+		goto out;
+	}
 
 	if (!objectid)
 		objectid = root->root_key.objectid;
@@ -2140,24 +2892,31 @@ static long btrfs_ioctl_default_subvol(struct file *file, void __user *argp)
 	location.offset = (u64)-1;
 
 	new_root = btrfs_read_fs_root_no_name(root->fs_info, &location);
-	if (IS_ERR(new_root))
-		return PTR_ERR(new_root);
+	if (IS_ERR(new_root)) {
+		ret = PTR_ERR(new_root);
+		goto out;
+	}
 
-	if (btrfs_root_refs(&new_root->root_item) == 0)
-		return -ENOENT;
+	if (btrfs_root_refs(&new_root->root_item) == 0) {
+		ret = -ENOENT;
+		goto out;
+	}
 
 	path = btrfs_alloc_path();
-	if (!path)
-		return -ENOMEM;
+	if (!path) {
+		ret = -ENOMEM;
+		goto out;
+	}
 	path->leave_spinning = 1;
 
 	trans = btrfs_start_transaction(root, 1);
 	if (IS_ERR(trans)) {
 		btrfs_free_path(path);
-		return PTR_ERR(trans);
+		ret = PTR_ERR(trans);
+		goto out;
 	}
 
-	dir_id = btrfs_super_root_dir(&root->fs_info->super_copy);
+	dir_id = btrfs_super_root_dir(root->fs_info->super_copy);
 	di = btrfs_lookup_dir_item(trans, root->fs_info->tree_root, path,
 				   dir_id, "default", 7, 1);
 	if (IS_ERR_OR_NULL(di)) {
@@ -2165,7 +2924,8 @@ static long btrfs_ioctl_default_subvol(struct file *file, void __user *argp)
 		btrfs_end_transaction(trans, root);
 		printk(KERN_ERR "Umm, you don't have the default dir item, "
 		       "this isn't going to work\n");
-		return -ENOENT;
+		ret = -ENOENT;
+		goto out;
 	}
 
 	btrfs_cpu_key_to_disk(&disk_key, &new_root->root_key);
@@ -2173,19 +2933,15 @@ static long btrfs_ioctl_default_subvol(struct file *file, void __user *argp)
 	btrfs_mark_buffer_dirty(path->nodes[0]);
 	btrfs_free_path(path);
 
-	disk_super = &root->fs_info->super_copy;
-	features = btrfs_super_incompat_flags(disk_super);
-	if (!(features & BTRFS_FEATURE_INCOMPAT_DEFAULT_SUBVOL)) {
-		features |= BTRFS_FEATURE_INCOMPAT_DEFAULT_SUBVOL;
-		btrfs_set_super_incompat_flags(disk_super, features);
-	}
+	btrfs_set_fs_incompat(root->fs_info, DEFAULT_SUBVOL);
 	btrfs_end_transaction(trans, root);
-
-	return 0;
+out:
+	mnt_drop_write_file(file);
+	return ret;
 }
 
-static void get_block_group_info(struct list_head *groups_list,
-				 struct btrfs_ioctl_space_info *space)
+void btrfs_get_block_group_info(struct list_head *groups_list,
+				struct btrfs_ioctl_space_info *space)
 {
 	struct btrfs_block_group_cache *block_group;
 
@@ -2206,7 +2962,7 @@ long btrfs_ioctl_space_info(struct btrfs_root *root, void __user *arg)
 	struct btrfs_ioctl_space_info space;
 	struct btrfs_ioctl_space_info *dest;
 	struct btrfs_ioctl_space_info *dest_orig;
-	struct btrfs_ioctl_space_info *user_dest;
+	struct btrfs_ioctl_space_info __user *user_dest;
 	struct btrfs_space_info *info;
 	u64 types[] = {BTRFS_BLOCK_GROUP_DATA,
 		       BTRFS_BLOCK_GROUP_SYSTEM,
@@ -2293,8 +3049,8 @@ long btrfs_ioctl_space_info(struct btrfs_root *root, void __user *arg)
 		down_read(&info->groups_sem);
 		for (c = 0; c < BTRFS_NR_RAID_TYPES; c++) {
 			if (!list_empty(&info->block_groups[c])) {
-				get_block_group_info(&info->block_groups[c],
-						     &space);
+				btrfs_get_block_group_info(
+					&info->block_groups[c], &space);
 				memcpy(dest, &space, sizeof(space));
 				dest++;
 				space_args.total_spaces++;
@@ -2306,7 +3062,7 @@ long btrfs_ioctl_space_info(struct btrfs_root *root, void __user *arg)
 		up_read(&info->groups_sem);
 	}
 
-	user_dest = (struct btrfs_ioctl_space_info *)
+	user_dest = (struct btrfs_ioctl_space_info __user *)
 		(arg + sizeof(struct btrfs_ioctl_space_args));
 
 	if (copy_to_user(user_dest, dest_orig, alloc_size))
@@ -2339,35 +3095,44 @@ long btrfs_ioctl_trans_end(struct file *file)
 
 	btrfs_end_transaction(trans, root);
 
-	mutex_lock(&root->fs_info->trans_mutex);
-	root->fs_info->open_ioctl_trans--;
-	mutex_unlock(&root->fs_info->trans_mutex);
+	atomic_dec(&root->fs_info->open_ioctl_trans);
 
-	mnt_drop_write(file->f_path.mnt);
+	mnt_drop_write_file(file);
 	return 0;
 }
 
-static noinline long btrfs_ioctl_start_sync(struct file *file, void __user *argp)
+static noinline long btrfs_ioctl_start_sync(struct btrfs_root *root,
+					    void __user *argp)
 {
-	struct btrfs_root *root = BTRFS_I(file->f_dentry->d_inode)->root;
 	struct btrfs_trans_handle *trans;
 	u64 transid;
+	int ret;
 
-	trans = btrfs_start_transaction(root, 0);
-	if (IS_ERR(trans))
-		return PTR_ERR(trans);
+	trans = btrfs_attach_transaction(root);
+	if (IS_ERR(trans)) {
+		if (PTR_ERR(trans) != -ENOENT)
+			return PTR_ERR(trans);
+
+		/* No running transaction, don't bother */
+		transid = root->fs_info->last_trans_committed;
+		goto out;
+	}
 	transid = trans->transid;
-	btrfs_commit_transaction_async(trans, root, 0);
-
+	ret = btrfs_commit_transaction_async(trans, root, 0);
+	if (ret) {
+		btrfs_end_transaction(trans, root);
+		return ret;
+	}
+out:
 	if (argp)
 		if (copy_to_user(argp, &transid, sizeof(transid)))
 			return -EFAULT;
 	return 0;
 }
 
-static noinline long btrfs_ioctl_wait_sync(struct file *file, void __user *argp)
+static noinline long btrfs_ioctl_wait_sync(struct btrfs_root *root,
+					   void __user *argp)
 {
-	struct btrfs_root *root = BTRFS_I(file->f_dentry->d_inode)->root;
 	u64 transid;
 
 	if (argp) {
@@ -2377,6 +3142,773 @@ static noinline long btrfs_ioctl_wait_sync(struct file *file, void __user *argp)
 		transid = 0;  /* current trans */
 	}
 	return btrfs_wait_for_commit(root, transid);
+}
+
+static long btrfs_ioctl_scrub(struct file *file, void __user *arg)
+{
+	struct btrfs_root *root = BTRFS_I(fdentry(file)->d_inode)->root;
+	struct btrfs_ioctl_scrub_args *sa;
+	int ret;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	sa = memdup_user(arg, sizeof(*sa));
+	if (IS_ERR(sa))
+		return PTR_ERR(sa);
+
+	if (!(sa->flags & BTRFS_SCRUB_READONLY)) {
+		ret = mnt_want_write_file(file);
+		if (ret)
+			goto out;
+	}
+
+	ret = btrfs_scrub_dev(root->fs_info, sa->devid, sa->start, sa->end,
+			      &sa->progress, sa->flags & BTRFS_SCRUB_READONLY,
+			      0);
+
+	if (copy_to_user(arg, sa, sizeof(*sa)))
+		ret = -EFAULT;
+
+	if (!(sa->flags & BTRFS_SCRUB_READONLY))
+		mnt_drop_write_file(file);
+out:
+	kfree(sa);
+	return ret;
+}
+
+static long btrfs_ioctl_scrub_cancel(struct btrfs_root *root, void __user *arg)
+{
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	return btrfs_scrub_cancel(root->fs_info);
+}
+
+static long btrfs_ioctl_scrub_progress(struct btrfs_root *root,
+				       void __user *arg)
+{
+	struct btrfs_ioctl_scrub_args *sa;
+	int ret;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	sa = memdup_user(arg, sizeof(*sa));
+	if (IS_ERR(sa))
+		return PTR_ERR(sa);
+
+	ret = btrfs_scrub_progress(root, sa->devid, &sa->progress);
+
+	if (copy_to_user(arg, sa, sizeof(*sa)))
+		ret = -EFAULT;
+
+	kfree(sa);
+	return ret;
+}
+
+static long btrfs_ioctl_get_dev_stats(struct btrfs_root *root,
+				      void __user *arg)
+{
+	struct btrfs_ioctl_get_dev_stats *sa;
+	int ret;
+
+	sa = memdup_user(arg, sizeof(*sa));
+	if (IS_ERR(sa))
+		return PTR_ERR(sa);
+
+	if ((sa->flags & BTRFS_DEV_STATS_RESET) && !capable(CAP_SYS_ADMIN)) {
+		kfree(sa);
+		return -EPERM;
+	}
+
+	ret = btrfs_get_dev_stats(root, sa);
+
+	if (copy_to_user(arg, sa, sizeof(*sa)))
+		ret = -EFAULT;
+
+	kfree(sa);
+	return ret;
+}
+
+static long btrfs_ioctl_dev_replace(struct btrfs_root *root, void __user *arg)
+{
+	struct btrfs_ioctl_dev_replace_args *p;
+	int ret;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	p = memdup_user(arg, sizeof(*p));
+	if (IS_ERR(p))
+		return PTR_ERR(p);
+
+	switch (p->cmd) {
+	case BTRFS_IOCTL_DEV_REPLACE_CMD_START:
+		if (atomic_xchg(
+			&root->fs_info->mutually_exclusive_operation_running,
+			1)) {
+			pr_info("btrfs: dev add/delete/balance/replace/resize operation in progress\n");
+			ret = -EINPROGRESS;
+		} else {
+			ret = btrfs_dev_replace_start(root, p);
+			atomic_set(
+			 &root->fs_info->mutually_exclusive_operation_running,
+			 0);
+		}
+		break;
+	case BTRFS_IOCTL_DEV_REPLACE_CMD_STATUS:
+		btrfs_dev_replace_status(root->fs_info, p);
+		ret = 0;
+		break;
+	case BTRFS_IOCTL_DEV_REPLACE_CMD_CANCEL:
+		ret = btrfs_dev_replace_cancel(root->fs_info, p);
+		break;
+	default:
+		ret = -EINVAL;
+		break;
+	}
+
+	if (copy_to_user(arg, p, sizeof(*p)))
+		ret = -EFAULT;
+
+	kfree(p);
+	return ret;
+}
+
+static long btrfs_ioctl_ino_to_path(struct btrfs_root *root, void __user *arg)
+{
+	int ret = 0;
+	int i;
+	u64 rel_ptr;
+	int size;
+	struct btrfs_ioctl_ino_path_args *ipa = NULL;
+	struct inode_fs_paths *ipath = NULL;
+	struct btrfs_path *path;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	path = btrfs_alloc_path();
+	if (!path) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	ipa = memdup_user(arg, sizeof(*ipa));
+	if (IS_ERR(ipa)) {
+		ret = PTR_ERR(ipa);
+		ipa = NULL;
+		goto out;
+	}
+
+	size = min_t(u32, ipa->size, 4096);
+	ipath = init_ipath(size, root, path);
+	if (IS_ERR(ipath)) {
+		ret = PTR_ERR(ipath);
+		ipath = NULL;
+		goto out;
+	}
+
+	ret = paths_from_inode(ipa->inum, ipath);
+	if (ret < 0)
+		goto out;
+
+	for (i = 0; i < ipath->fspath->elem_cnt; ++i) {
+		rel_ptr = ipath->fspath->val[i] -
+			  (u64)(unsigned long)ipath->fspath->val;
+		ipath->fspath->val[i] = rel_ptr;
+	}
+
+	ret = copy_to_user((void *)(unsigned long)ipa->fspath,
+			   (void *)(unsigned long)ipath->fspath, size);
+	if (ret) {
+		ret = -EFAULT;
+		goto out;
+	}
+
+out:
+	btrfs_free_path(path);
+	free_ipath(ipath);
+	kfree(ipa);
+
+	return ret;
+}
+
+static int build_ino_list(u64 inum, u64 offset, u64 root, void *ctx)
+{
+	struct btrfs_data_container *inodes = ctx;
+	const size_t c = 3 * sizeof(u64);
+
+	if (inodes->bytes_left >= c) {
+		inodes->bytes_left -= c;
+		inodes->val[inodes->elem_cnt] = inum;
+		inodes->val[inodes->elem_cnt + 1] = offset;
+		inodes->val[inodes->elem_cnt + 2] = root;
+		inodes->elem_cnt += 3;
+	} else {
+		inodes->bytes_missing += c - inodes->bytes_left;
+		inodes->bytes_left = 0;
+		inodes->elem_missed += 3;
+	}
+
+	return 0;
+}
+
+static long btrfs_ioctl_logical_to_ino(struct btrfs_root *root,
+					void __user *arg)
+{
+	int ret = 0;
+	int size;
+	struct btrfs_ioctl_logical_ino_args *loi;
+	struct btrfs_data_container *inodes = NULL;
+	struct btrfs_path *path = NULL;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	loi = memdup_user(arg, sizeof(*loi));
+	if (IS_ERR(loi)) {
+		ret = PTR_ERR(loi);
+		loi = NULL;
+		goto out;
+	}
+
+	path = btrfs_alloc_path();
+	if (!path) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	size = min_t(u32, loi->size, 64 * 1024);
+	inodes = init_data_container(size);
+	if (IS_ERR(inodes)) {
+		ret = PTR_ERR(inodes);
+		inodes = NULL;
+		goto out;
+	}
+
+	ret = iterate_inodes_from_logical(loi->logical, root->fs_info, path,
+					  build_ino_list, inodes);
+	if (ret == -EINVAL)
+		ret = -ENOENT;
+	if (ret < 0)
+		goto out;
+
+	ret = copy_to_user((void *)(unsigned long)loi->inodes,
+			   (void *)(unsigned long)inodes, size);
+	if (ret)
+		ret = -EFAULT;
+
+out:
+	btrfs_free_path(path);
+	vfree(inodes);
+	kfree(loi);
+
+	return ret;
+}
+
+void update_ioctl_balance_args(struct btrfs_fs_info *fs_info, int lock,
+			       struct btrfs_ioctl_balance_args *bargs)
+{
+	struct btrfs_balance_control *bctl = fs_info->balance_ctl;
+
+	bargs->flags = bctl->flags;
+
+	if (atomic_read(&fs_info->balance_running))
+		bargs->state |= BTRFS_BALANCE_STATE_RUNNING;
+	if (atomic_read(&fs_info->balance_pause_req))
+		bargs->state |= BTRFS_BALANCE_STATE_PAUSE_REQ;
+	if (atomic_read(&fs_info->balance_cancel_req))
+		bargs->state |= BTRFS_BALANCE_STATE_CANCEL_REQ;
+
+	memcpy(&bargs->data, &bctl->data, sizeof(bargs->data));
+	memcpy(&bargs->meta, &bctl->meta, sizeof(bargs->meta));
+	memcpy(&bargs->sys, &bctl->sys, sizeof(bargs->sys));
+
+	if (lock) {
+		spin_lock(&fs_info->balance_lock);
+		memcpy(&bargs->stat, &bctl->stat, sizeof(bargs->stat));
+		spin_unlock(&fs_info->balance_lock);
+	} else {
+		memcpy(&bargs->stat, &bctl->stat, sizeof(bargs->stat));
+	}
+}
+
+static long btrfs_ioctl_balance(struct file *file, void __user *arg)
+{
+	struct btrfs_root *root = BTRFS_I(fdentry(file)->d_inode)->root;
+	struct btrfs_fs_info *fs_info = root->fs_info;
+	struct btrfs_ioctl_balance_args *bargs;
+	struct btrfs_balance_control *bctl;
+	bool need_unlock; /* for mut. excl. ops lock */
+	int ret;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	ret = mnt_want_write_file(file);
+	if (ret)
+		return ret;
+
+again:
+	if (!atomic_xchg(&fs_info->mutually_exclusive_operation_running, 1)) {
+		mutex_lock(&fs_info->volume_mutex);
+		mutex_lock(&fs_info->balance_mutex);
+		need_unlock = true;
+		goto locked;
+	}
+
+	/*
+	 * mut. excl. ops lock is locked.  Three possibilites:
+	 *   (1) some other op is running
+	 *   (2) balance is running
+	 *   (3) balance is paused -- special case (think resume)
+	 */
+	mutex_lock(&fs_info->balance_mutex);
+	if (fs_info->balance_ctl) {
+		/* this is either (2) or (3) */
+		if (!atomic_read(&fs_info->balance_running)) {
+			mutex_unlock(&fs_info->balance_mutex);
+			if (!mutex_trylock(&fs_info->volume_mutex))
+				goto again;
+			mutex_lock(&fs_info->balance_mutex);
+
+			if (fs_info->balance_ctl &&
+			    !atomic_read(&fs_info->balance_running)) {
+				/* this is (3) */
+				need_unlock = false;
+				goto locked;
+			}
+
+			mutex_unlock(&fs_info->balance_mutex);
+			mutex_unlock(&fs_info->volume_mutex);
+			goto again;
+		} else {
+			/* this is (2) */
+			mutex_unlock(&fs_info->balance_mutex);
+			ret = -EINPROGRESS;
+			goto out;
+		}
+	} else {
+		/* this is (1) */
+		mutex_unlock(&fs_info->balance_mutex);
+		pr_info("btrfs: dev add/delete/balance/replace/resize operation in progress\n");
+		ret = -EINVAL;
+		goto out;
+	}
+
+locked:
+	BUG_ON(!atomic_read(&fs_info->mutually_exclusive_operation_running));
+
+	if (arg) {
+		bargs = memdup_user(arg, sizeof(*bargs));
+		if (IS_ERR(bargs)) {
+			ret = PTR_ERR(bargs);
+			goto out_unlock;
+		}
+
+		if (bargs->flags & BTRFS_BALANCE_RESUME) {
+			if (!fs_info->balance_ctl) {
+				ret = -ENOTCONN;
+				goto out_bargs;
+			}
+
+			bctl = fs_info->balance_ctl;
+			spin_lock(&fs_info->balance_lock);
+			bctl->flags |= BTRFS_BALANCE_RESUME;
+			spin_unlock(&fs_info->balance_lock);
+
+			goto do_balance;
+		}
+	} else {
+		bargs = NULL;
+	}
+
+	if (fs_info->balance_ctl) {
+		ret = -EINPROGRESS;
+		goto out_bargs;
+	}
+
+	bctl = kzalloc(sizeof(*bctl), GFP_NOFS);
+	if (!bctl) {
+		ret = -ENOMEM;
+		goto out_bargs;
+	}
+
+	bctl->fs_info = fs_info;
+	if (arg) {
+		memcpy(&bctl->data, &bargs->data, sizeof(bctl->data));
+		memcpy(&bctl->meta, &bargs->meta, sizeof(bctl->meta));
+		memcpy(&bctl->sys, &bargs->sys, sizeof(bctl->sys));
+
+		bctl->flags = bargs->flags;
+	} else {
+		/* balance everything - no filters */
+		bctl->flags |= BTRFS_BALANCE_TYPE_MASK;
+	}
+
+do_balance:
+	/*
+	 * Ownership of bctl and mutually_exclusive_operation_running
+	 * goes to to btrfs_balance.  bctl is freed in __cancel_balance,
+	 * or, if restriper was paused all the way until unmount, in
+	 * free_fs_info.  mutually_exclusive_operation_running is
+	 * cleared in __cancel_balance.
+	 */
+	need_unlock = false;
+
+	ret = btrfs_balance(bctl, bargs);
+
+	if (arg) {
+		if (copy_to_user(arg, bargs, sizeof(*bargs)))
+			ret = -EFAULT;
+	}
+
+out_bargs:
+	kfree(bargs);
+out_unlock:
+	mutex_unlock(&fs_info->balance_mutex);
+	mutex_unlock(&fs_info->volume_mutex);
+	if (need_unlock)
+		atomic_set(&fs_info->mutually_exclusive_operation_running, 0);
+out:
+	mnt_drop_write_file(file);
+	return ret;
+}
+
+static long btrfs_ioctl_balance_ctl(struct btrfs_root *root, int cmd)
+{
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	switch (cmd) {
+	case BTRFS_BALANCE_CTL_PAUSE:
+		return btrfs_pause_balance(root->fs_info);
+	case BTRFS_BALANCE_CTL_CANCEL:
+		return btrfs_cancel_balance(root->fs_info);
+	}
+
+	return -EINVAL;
+}
+
+static long btrfs_ioctl_balance_progress(struct btrfs_root *root,
+					 void __user *arg)
+{
+	struct btrfs_fs_info *fs_info = root->fs_info;
+	struct btrfs_ioctl_balance_args *bargs;
+	int ret = 0;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	mutex_lock(&fs_info->balance_mutex);
+	if (!fs_info->balance_ctl) {
+		ret = -ENOTCONN;
+		goto out;
+	}
+
+	bargs = kzalloc(sizeof(*bargs), GFP_NOFS);
+	if (!bargs) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	update_ioctl_balance_args(fs_info, 1, bargs);
+
+	if (copy_to_user(arg, bargs, sizeof(*bargs)))
+		ret = -EFAULT;
+
+	kfree(bargs);
+out:
+	mutex_unlock(&fs_info->balance_mutex);
+	return ret;
+}
+
+static long btrfs_ioctl_quota_ctl(struct file *file, void __user *arg)
+{
+	struct btrfs_root *root = BTRFS_I(fdentry(file)->d_inode)->root;
+	struct btrfs_ioctl_quota_ctl_args *sa;
+	struct btrfs_trans_handle *trans = NULL;
+	int ret;
+	int err;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	ret = mnt_want_write_file(file);
+	if (ret)
+		return ret;
+
+	sa = memdup_user(arg, sizeof(*sa));
+	if (IS_ERR(sa)) {
+		ret = PTR_ERR(sa);
+		goto drop_write;
+	}
+
+	if (sa->cmd != BTRFS_QUOTA_CTL_RESCAN) {
+		trans = btrfs_start_transaction(root, 2);
+		if (IS_ERR(trans)) {
+			ret = PTR_ERR(trans);
+			goto out;
+		}
+	}
+
+	switch (sa->cmd) {
+	case BTRFS_QUOTA_CTL_ENABLE:
+		ret = btrfs_quota_enable(trans, root->fs_info);
+		break;
+	case BTRFS_QUOTA_CTL_DISABLE:
+		ret = btrfs_quota_disable(trans, root->fs_info);
+		break;
+	case BTRFS_QUOTA_CTL_RESCAN:
+		ret = btrfs_quota_rescan(root->fs_info);
+		break;
+	default:
+		ret = -EINVAL;
+		break;
+	}
+
+	if (copy_to_user(arg, sa, sizeof(*sa)))
+		ret = -EFAULT;
+
+	if (trans) {
+		err = btrfs_commit_transaction(trans, root);
+		if (err && !ret)
+			ret = err;
+	}
+out:
+	kfree(sa);
+drop_write:
+	mnt_drop_write_file(file);
+	return ret;
+}
+
+static long btrfs_ioctl_qgroup_assign(struct file *file, void __user *arg)
+{
+	struct btrfs_root *root = BTRFS_I(fdentry(file)->d_inode)->root;
+	struct btrfs_ioctl_qgroup_assign_args *sa;
+	struct btrfs_trans_handle *trans;
+	int ret;
+	int err;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	ret = mnt_want_write_file(file);
+	if (ret)
+		return ret;
+
+	sa = memdup_user(arg, sizeof(*sa));
+	if (IS_ERR(sa)) {
+		ret = PTR_ERR(sa);
+		goto drop_write;
+	}
+
+	trans = btrfs_join_transaction(root);
+	if (IS_ERR(trans)) {
+		ret = PTR_ERR(trans);
+		goto out;
+	}
+
+	/* FIXME: check if the IDs really exist */
+	if (sa->assign) {
+		ret = btrfs_add_qgroup_relation(trans, root->fs_info,
+						sa->src, sa->dst);
+	} else {
+		ret = btrfs_del_qgroup_relation(trans, root->fs_info,
+						sa->src, sa->dst);
+	}
+
+	err = btrfs_end_transaction(trans, root);
+	if (err && !ret)
+		ret = err;
+
+out:
+	kfree(sa);
+drop_write:
+	mnt_drop_write_file(file);
+	return ret;
+}
+
+static long btrfs_ioctl_qgroup_create(struct file *file, void __user *arg)
+{
+	struct btrfs_root *root = BTRFS_I(fdentry(file)->d_inode)->root;
+	struct btrfs_ioctl_qgroup_create_args *sa;
+	struct btrfs_trans_handle *trans;
+	int ret;
+	int err;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	ret = mnt_want_write_file(file);
+	if (ret)
+		return ret;
+
+	sa = memdup_user(arg, sizeof(*sa));
+	if (IS_ERR(sa)) {
+		ret = PTR_ERR(sa);
+		goto drop_write;
+	}
+
+	if (!sa->qgroupid) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	trans = btrfs_join_transaction(root);
+	if (IS_ERR(trans)) {
+		ret = PTR_ERR(trans);
+		goto out;
+	}
+
+	/* FIXME: check if the IDs really exist */
+	if (sa->create) {
+		ret = btrfs_create_qgroup(trans, root->fs_info, sa->qgroupid,
+					  NULL);
+	} else {
+		ret = btrfs_remove_qgroup(trans, root->fs_info, sa->qgroupid);
+	}
+
+	err = btrfs_end_transaction(trans, root);
+	if (err && !ret)
+		ret = err;
+
+out:
+	kfree(sa);
+drop_write:
+	mnt_drop_write_file(file);
+	return ret;
+}
+
+static long btrfs_ioctl_qgroup_limit(struct file *file, void __user *arg)
+{
+	struct btrfs_root *root = BTRFS_I(fdentry(file)->d_inode)->root;
+	struct btrfs_ioctl_qgroup_limit_args *sa;
+	struct btrfs_trans_handle *trans;
+	int ret;
+	int err;
+	u64 qgroupid;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	ret = mnt_want_write_file(file);
+	if (ret)
+		return ret;
+
+	sa = memdup_user(arg, sizeof(*sa));
+	if (IS_ERR(sa)) {
+		ret = PTR_ERR(sa);
+		goto drop_write;
+	}
+
+	trans = btrfs_join_transaction(root);
+	if (IS_ERR(trans)) {
+		ret = PTR_ERR(trans);
+		goto out;
+	}
+
+	qgroupid = sa->qgroupid;
+	if (!qgroupid) {
+		/* take the current subvol as qgroup */
+		qgroupid = root->root_key.objectid;
+	}
+
+	/* FIXME: check if the IDs really exist */
+	ret = btrfs_limit_qgroup(trans, root->fs_info, qgroupid, &sa->lim);
+
+	err = btrfs_end_transaction(trans, root);
+	if (err && !ret)
+		ret = err;
+
+out:
+	kfree(sa);
+drop_write:
+	mnt_drop_write_file(file);
+	return ret;
+}
+
+static long btrfs_ioctl_set_received_subvol(struct file *file,
+					    void __user *arg)
+{
+	struct btrfs_ioctl_received_subvol_args *sa = NULL;
+	struct inode *inode = fdentry(file)->d_inode;
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	struct btrfs_root_item *root_item = &root->root_item;
+	struct btrfs_trans_handle *trans;
+	struct timespec ct = CURRENT_TIME;
+	int ret = 0;
+
+	ret = mnt_want_write_file(file);
+	if (ret < 0)
+		return ret;
+
+	down_write(&root->fs_info->subvol_sem);
+
+	if (btrfs_ino(inode) != BTRFS_FIRST_FREE_OBJECTID) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (btrfs_root_readonly(root)) {
+		ret = -EROFS;
+		goto out;
+	}
+
+	if (!inode_owner_or_capable(inode)) {
+		ret = -EACCES;
+		goto out;
+	}
+
+	sa = memdup_user(arg, sizeof(*sa));
+	if (IS_ERR(sa)) {
+		ret = PTR_ERR(sa);
+		sa = NULL;
+		goto out;
+	}
+
+	trans = btrfs_start_transaction(root, 1);
+	if (IS_ERR(trans)) {
+		ret = PTR_ERR(trans);
+		trans = NULL;
+		goto out;
+	}
+
+	sa->rtransid = trans->transid;
+	sa->rtime.sec = ct.tv_sec;
+	sa->rtime.nsec = ct.tv_nsec;
+
+	memcpy(root_item->received_uuid, sa->uuid, BTRFS_UUID_SIZE);
+	btrfs_set_root_stransid(root_item, sa->stransid);
+	btrfs_set_root_rtransid(root_item, sa->rtransid);
+	root_item->stime.sec = cpu_to_le64(sa->stime.sec);
+	root_item->stime.nsec = cpu_to_le32(sa->stime.nsec);
+	root_item->rtime.sec = cpu_to_le64(sa->rtime.sec);
+	root_item->rtime.nsec = cpu_to_le32(sa->rtime.nsec);
+
+	ret = btrfs_update_root(trans, root->fs_info->tree_root,
+				&root->root_key, &root->root_item);
+	if (ret < 0) {
+		btrfs_end_transaction(trans, root);
+		trans = NULL;
+		goto out;
+	} else {
+		ret = btrfs_commit_transaction(trans, root);
+		if (ret < 0)
+			goto out;
+	}
+
+	ret = copy_to_user(arg, sa, sizeof(*sa));
+	if (ret)
+		ret = -EFAULT;
+
+out:
+	kfree(sa);
+	up_write(&root->fs_info->subvol_sem);
+	mnt_drop_write_file(file);
+	return ret;
 }
 
 long btrfs_ioctl(struct file *file, unsigned int
@@ -2392,12 +3924,16 @@ long btrfs_ioctl(struct file *file, unsigned int
 		return btrfs_ioctl_setflags(file, argp);
 	case FS_IOC_GETVERSION:
 		return btrfs_ioctl_getversion(file, argp);
+	case FITRIM:
+		return btrfs_ioctl_fitrim(file, argp);
 	case BTRFS_IOC_SNAP_CREATE:
 		return btrfs_ioctl_snap_create(file, argp, 0);
 	case BTRFS_IOC_SNAP_CREATE_V2:
 		return btrfs_ioctl_snap_create_v2(file, argp, 0);
 	case BTRFS_IOC_SUBVOL_CREATE:
 		return btrfs_ioctl_snap_create(file, argp, 1);
+	case BTRFS_IOC_SUBVOL_CREATE_V2:
+		return btrfs_ioctl_snap_create_v2(file, argp, 1);
 	case BTRFS_IOC_SNAP_DESTROY:
 		return btrfs_ioctl_snap_destroy(file, argp);
 	case BTRFS_IOC_SUBVOL_GETFLAGS:
@@ -2411,13 +3947,17 @@ long btrfs_ioctl(struct file *file, unsigned int
 	case BTRFS_IOC_DEFRAG_RANGE:
 		return btrfs_ioctl_defrag(file, argp);
 	case BTRFS_IOC_RESIZE:
-		return btrfs_ioctl_resize(root, argp);
+		return btrfs_ioctl_resize(file, argp);
 	case BTRFS_IOC_ADD_DEV:
 		return btrfs_ioctl_add_dev(root, argp);
 	case BTRFS_IOC_RM_DEV:
-		return btrfs_ioctl_rm_dev(root, argp);
+		return btrfs_ioctl_rm_dev(file, argp);
+	case BTRFS_IOC_FS_INFO:
+		return btrfs_ioctl_fs_info(root, argp);
+	case BTRFS_IOC_DEV_INFO:
+		return btrfs_ioctl_dev_info(root, argp);
 	case BTRFS_IOC_BALANCE:
-		return btrfs_balance(root->fs_info->dev_root);
+		return btrfs_ioctl_balance(file, NULL);
 	case BTRFS_IOC_CLONE:
 		return btrfs_ioctl_clone(file, arg, 0, 0, 0);
 	case BTRFS_IOC_CLONE_RANGE:
@@ -2430,15 +3970,47 @@ long btrfs_ioctl(struct file *file, unsigned int
 		return btrfs_ioctl_tree_search(file, argp);
 	case BTRFS_IOC_INO_LOOKUP:
 		return btrfs_ioctl_ino_lookup(file, argp);
+	case BTRFS_IOC_INO_PATHS:
+		return btrfs_ioctl_ino_to_path(root, argp);
+	case BTRFS_IOC_LOGICAL_INO:
+		return btrfs_ioctl_logical_to_ino(root, argp);
 	case BTRFS_IOC_SPACE_INFO:
 		return btrfs_ioctl_space_info(root, argp);
 	case BTRFS_IOC_SYNC:
 		btrfs_sync_fs(file->f_dentry->d_sb, 1);
 		return 0;
 	case BTRFS_IOC_START_SYNC:
-		return btrfs_ioctl_start_sync(file, argp);
+		return btrfs_ioctl_start_sync(root, argp);
 	case BTRFS_IOC_WAIT_SYNC:
-		return btrfs_ioctl_wait_sync(file, argp);
+		return btrfs_ioctl_wait_sync(root, argp);
+	case BTRFS_IOC_SCRUB:
+		return btrfs_ioctl_scrub(file, argp);
+	case BTRFS_IOC_SCRUB_CANCEL:
+		return btrfs_ioctl_scrub_cancel(root, argp);
+	case BTRFS_IOC_SCRUB_PROGRESS:
+		return btrfs_ioctl_scrub_progress(root, argp);
+	case BTRFS_IOC_BALANCE_V2:
+		return btrfs_ioctl_balance(file, argp);
+	case BTRFS_IOC_BALANCE_CTL:
+		return btrfs_ioctl_balance_ctl(root, arg);
+	case BTRFS_IOC_BALANCE_PROGRESS:
+		return btrfs_ioctl_balance_progress(root, argp);
+	case BTRFS_IOC_SET_RECEIVED_SUBVOL:
+		return btrfs_ioctl_set_received_subvol(file, argp);
+	case BTRFS_IOC_SEND:
+		return btrfs_ioctl_send(file, argp);
+	case BTRFS_IOC_GET_DEV_STATS:
+		return btrfs_ioctl_get_dev_stats(root, argp);
+	case BTRFS_IOC_QUOTA_CTL:
+		return btrfs_ioctl_quota_ctl(file, argp);
+	case BTRFS_IOC_QGROUP_ASSIGN:
+		return btrfs_ioctl_qgroup_assign(file, argp);
+	case BTRFS_IOC_QGROUP_CREATE:
+		return btrfs_ioctl_qgroup_create(file, argp);
+	case BTRFS_IOC_QGROUP_LIMIT:
+		return btrfs_ioctl_qgroup_limit(file, argp);
+	case BTRFS_IOC_DEV_REPLACE:
+		return btrfs_ioctl_dev_replace(root, argp);
 	}
 
 	return -ENOTTY;

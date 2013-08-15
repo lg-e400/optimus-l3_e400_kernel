@@ -77,7 +77,7 @@ static void wpadev_setup(struct net_device *dev)
 
 /*
  * Description:
- *      register netdev for wpa supplicant deamon
+ *      register netdev for wpa supplicant daemon
  *
  * Parameters:
  *  In:
@@ -164,7 +164,7 @@ static int wpa_release_wpadev(PSDevice pDevice)
 
 /*
  * Description:
- *      Set enable/disable dev for wpa supplicant deamon
+ *      Set enable/disable dev for wpa supplicant daemon
  *
  * Parameters:
  *  In:
@@ -213,7 +213,9 @@ int wpa_set_wpadev(PSDevice pDevice, int val)
 	int uu, ii;
 
 
-	if (param->u.wpa_key.alg_name > WPA_ALG_CCMP)
+	if (param->u.wpa_key.alg_name > WPA_ALG_CCMP ||
+			param->u.wpa_key.key_len >= MAX_KEY_LEN ||
+			param->u.wpa_key.seq_len >= MAX_KEY_LEN)
 		return -EINVAL;
 
     DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO "param->u.wpa_key.alg_name = %d \n", param->u.wpa_key.alg_name);
@@ -653,7 +655,7 @@ static int wpa_get_scan(PSDevice pDevice,
 
          }
 
-    };
+    }
 
   kfree(ptempBSS);
 
@@ -679,7 +681,7 @@ static int wpa_get_scan(PSDevice pDevice,
         if (!pBSS->bActive)
             continue;
         count++;
-    };
+    }
 
     pBuf = kcalloc(count, sizeof(struct viawget_scan_result), (int)GFP_ATOMIC);
 
@@ -723,7 +725,7 @@ static int wpa_get_scan(PSDevice pDevice,
 
     if (copy_to_user(param->u.scan_results.buf, pBuf, sizeof(struct viawget_scan_result) * count)) {
 		ret = -EFAULT;
-	};
+	}
 	param->u.scan_results.scan_count = count;
     DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO " param->u.scan_results.scan_count = %d\n", count)
 
@@ -832,7 +834,7 @@ else
 		break;
 	default:
 		pDevice->eEncryptionStatus = Ndis802_11EncryptionDisabled;
-	};
+	}
 
 //DavidWang add for WPA_supplicant support open/share mode
 
@@ -845,7 +847,7 @@ else
           if(!bWepEnabled)  pDevice->eEncryptionStatus = Ndis802_11EncryptionDisabled;
 	else pDevice->eEncryptionStatus = Ndis802_11Encryption1Enabled;
             //pMgmt->eAuthenMode = WMAC_AUTH_OPEN;
-            //pMgmt->bShareKeyAlgorithm = false; //20080717-06,<Modify> by chester//Fix Open mode, WEP encrytion
+            //pMgmt->bShareKeyAlgorithm = false; //20080717-06,<Modify> by chester//Fix Open mode, WEP encryption
            }
 //mike save old encryption status
 	pDevice->eOldEncryptionStatus = pDevice->eEncryptionStatus;
@@ -875,7 +877,7 @@ if (!((pMgmt->eAuthenMode == WMAC_AUTH_SHAREKEY) ||
     if (pCurr == NULL){
     printk("wpa_set_associate---->hidden mode site survey before associate.......\n");
     bScheduleCommand((void *) pDevice, WLAN_CMD_BSSID_SCAN, pMgmt->abyDesireSSID);
-  };
+  }
 }
 /****************************************************************/
     bScheduleCommand((void *) pDevice, WLAN_CMD_SSID, NULL);
@@ -987,8 +989,7 @@ int wpa_ioctl(PSDevice pDevice, struct iw_point *p)
 	}
 
 out:
-	if (param != NULL)
-		kfree(param);
+	kfree(param);
 
 	return ret;
 }

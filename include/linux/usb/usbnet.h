@@ -43,11 +43,10 @@ struct usbnet {
 	/* protocol/interface state */
 	struct net_device	*net;
 	int			msg_enable;
-	unsigned long		data[6];
+	unsigned long		data[5];
 	u32			xid;
 	u32			hard_mtu;	/* count any extra framing */
-	size_t		rx_urb_size;	/* size for rx urbs */
-	int			rx_queue_enable;
+	size_t			rx_urb_size;	/* size for rx urbs */
 	struct mii_if_info	mii;
 
 	/* various kinds of pending driver work */
@@ -67,8 +66,10 @@ struct usbnet {
 #		define EVENT_STS_SPLIT	3
 #		define EVENT_LINK_RESET	4
 #		define EVENT_RX_PAUSED	5
-#		define EVENT_DEV_WAKING 6
-#		define EVENT_DEV_ASLEEP 7
+#		define EVENT_DEV_ASLEEP 6
+#		define EVENT_DEV_OPEN	7
+#		define EVENT_DEVICE_REPORT_IDLE	8
+#		define EVENT_NO_RUNTIME_PM	9
 };
 
 static inline struct usb_driver *driver_of(struct usb_interface *intf)
@@ -98,11 +99,15 @@ struct driver_info {
 
 #define FLAG_LINK_INTR	0x0800		/* updates link (carrier) status */
 
+#define FLAG_POINTTOPOINT 0x1000	/* possibly use "usb%d" names */
+#define FLAG_NOARP	0x2000		/* device can't do ARP */
+
 /*
  * Indicates to usbnet, that USB driver accumulates multiple IP packets.
  * Affects statistic (counters) and short packet handling.
  */
-#define FLAG_MULTI_PACKET	0x1000
+#define FLAG_MULTI_PACKET	0x2000
+#define FLAG_RX_ASSEMBLE	0x4000	/* rx packets may span >1 frames */
 
 	/* init device ... can sleep, or cause probe() failure */
 	int	(*bind)(struct usbnet *, struct usb_interface *);
@@ -158,7 +163,18 @@ extern int usbnet_probe(struct usb_interface *, const struct usb_device_id *);
 extern int usbnet_suspend(struct usb_interface *, pm_message_t);
 extern int usbnet_resume(struct usb_interface *);
 extern void usbnet_disconnect(struct usb_interface *);
+extern void usbnet_device_suggests_idle(struct usbnet *dev);
 
+extern int usbnet_read_cmd(struct usbnet *dev, u8 cmd, u8 reqtype,
+		    u16 value, u16 index, void *data, u16 size);
+extern int usbnet_write_cmd(struct usbnet *dev, u8 cmd, u8 reqtype,
+		    u16 value, u16 index, const void *data, u16 size);
+extern int usbnet_read_cmd_nopm(struct usbnet *dev, u8 cmd, u8 reqtype,
+		    u16 value, u16 index, void *data, u16 size);
+extern int usbnet_write_cmd_nopm(struct usbnet *dev, u8 cmd, u8 reqtype,
+		    u16 value, u16 index, const void *data, u16 size);
+extern int usbnet_write_cmd_async(struct usbnet *dev, u8 cmd, u8 reqtype,
+		    u16 value, u16 index, const void *data, u16 size);
 
 /* Drivers that reuse some of the standard USB CDC infrastructure
  * (notably, using multiple interfaces according to the CDC
@@ -168,14 +184,14 @@ struct cdc_state {
 	struct usb_cdc_header_desc	*header;
 	struct usb_cdc_union_desc	*u;
 	struct usb_cdc_ether_desc	*ether;
-	struct usb_cdc_ncm_desc		*ncm;
 	struct usb_interface		*control;
 	struct usb_interface		*data;
 };
 
 extern int usbnet_generic_cdc_bind(struct usbnet *, struct usb_interface *);
+extern int usbnet_cdc_bind(struct usbnet *, struct usb_interface *);
 extern void usbnet_cdc_unbind(struct usbnet *, struct usb_interface *);
-extern void usbnet_cdc_status(struct usbnet *dev, struct urb *urb);
+extern void usbnet_cdc_status(struct usbnet *, struct urb *);
 
 /* CDC and RNDIS support the same host-chosen packet filters for IN transfers */
 #define	DEFAULT_FILTER	(USB_CDC_PACKET_TYPE_BROADCAST \
@@ -188,7 +204,8 @@ extern void usbnet_cdc_status(struct usbnet *dev, struct urb *urb);
 enum skb_state {
 	illegal = 0,
 	tx_start, tx_done,
-	rx_start, rx_done, rx_cleanup
+	rx_start, rx_done, rx_cleanup,
+	unlink_start
 };
 
 struct skb_data {	/* skb->cb is one of these */
@@ -224,5 +241,7 @@ extern u32 usbnet_get_msglevel(struct net_device *);
 extern void usbnet_set_msglevel(struct net_device *, u32);
 extern void usbnet_get_drvinfo(struct net_device *, struct ethtool_drvinfo *);
 extern int usbnet_nway_reset(struct net_device *net);
+
+extern int usbnet_manage_power(struct usbnet *, int);
 
 #endif /* __LINUX_USB_USBNET_H */

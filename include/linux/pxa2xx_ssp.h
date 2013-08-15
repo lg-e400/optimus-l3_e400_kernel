@@ -122,7 +122,7 @@
 #define SSCR1_TSRE		(1 << 21)	/* Transmit Service Request Enable */
 #define SSCR1_RSRE		(1 << 20)	/* Receive Service Request Enable */
 #define SSCR1_TINTE		(1 << 19)	/* Receiver Time-out Interrupt enable */
-#define SSCR1_PINTE		(1 << 18)	/* Peripheral Trailing Byte Interupt Enable */
+#define SSCR1_PINTE		(1 << 18)	/* Peripheral Trailing Byte Interrupt Enable */
 #define SSCR1_IFS		(1 << 16)	/* Invert Frame Signal */
 #define SSCR1_STRF		(1 << 15)	/* Select FIFO or EFWR */
 #define SSCR1_EFWR		(1 << 14)	/* Enable FIFO Write/Read */
@@ -160,7 +160,9 @@ enum pxa_ssp_type {
 	PXA25x_SSP,  /* pxa 210, 250, 255, 26x */
 	PXA25x_NSSP, /* pxa 255, 26x (including ASSP) */
 	PXA27x_SSP,
+	PXA3xx_SSP,
 	PXA168_SSP,
+	PXA910_SSP,
 	CE4100_SSP,
 };
 

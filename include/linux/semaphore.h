@@ -14,21 +14,17 @@
 
 /* Please don't access any members of this structure directly */
 struct semaphore {
-	spinlock_t		lock;
+	raw_spinlock_t		lock;
 	unsigned int		count;
 	struct list_head	wait_list;
 };
 
-#ifdef __SPLINT__
-#define __SEMAPHORE_INITIALIZER(name, n)	NULL				
-#else
 #define __SEMAPHORE_INITIALIZER(name, n)				\
 {									\
-	.lock		= __SPIN_LOCK_UNLOCKED((name).lock),		\
+	.lock		= __RAW_SPIN_LOCK_UNLOCKED((name).lock),	\
 	.count		= n,						\
 	.wait_list	= LIST_HEAD_INIT((name).wait_list),		\
 }
-#endif
 
 #define DEFINE_SEMAPHORE(name)	\
 	struct semaphore name = __SEMAPHORE_INITIALIZER(name, 1)

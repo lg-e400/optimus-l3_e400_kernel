@@ -207,7 +207,7 @@ PSbConsiderPowerDown(
     if (pDevice->bCmdRunning)
         return false;
 
-    // Froce PSEN on
+    // Force PSEN on
     MACvRegBitsOn(pDevice->PortOffset, MAC_REG_PSCTL, PSCTL_PSEN);
 
     // check if all TD are empty,
@@ -221,7 +221,7 @@ PSbConsiderPowerDown(
         ((pDevice->dwIsr& ISR_RXDMA0) != 0) &&
         ((pDevice->dwIsr & ISR_RXDMA1) != 0)){
         return false;
-    };
+    }
 
     if (pMgmt->eCurrMode != WMAC_MODE_IBSS_STA) {
         if (bCheckCountToWakeUp &&

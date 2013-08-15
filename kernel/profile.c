@@ -8,12 +8,13 @@
  *  Scheduler profiling support, Arjan van de Ven and Ingo Molnar,
  *	Red Hat, July 2004
  *  Consolidation of architecture support code for profiling,
- *	William Irwin, Oracle, July 2004
+ *	Nadia Yvette Chambers, Oracle, July 2004
  *  Amortized hit count accounting via per-cpu open-addressed hashtables
- *	to resolve timer interrupt livelocks, William Irwin, Oracle, 2004
+ *	to resolve timer interrupt livelocks, Nadia Yvette Chambers,
+ *	Oracle, 2004
  */
 
-#include <linux/module.h>
+#include <linux/export.h>
 #include <linux/profile.h>
 #include <linux/bootmem.h>
 #include <linux/notifier.h>
@@ -126,11 +127,9 @@ int __ref profile_init(void)
 	if (prof_buffer)
 		return 0;
 
-	prof_buffer = vmalloc(buffer_bytes);
-	if (prof_buffer) {
-		memset(prof_buffer, 0, buffer_bytes);
+	prof_buffer = vzalloc(buffer_bytes);
+	if (prof_buffer)
 		return 0;
-	}
 
 	free_cpumask_var(prof_cpu_mask);
 	return -ENOMEM;
@@ -258,7 +257,7 @@ EXPORT_SYMBOL_GPL(unregister_timer_hook);
  * pagetable hash functions, but uses a full hashtable full of finite
  * collision chains, not just pairs of them.
  *
- * -- wli
+ * -- nyc
  */
 static void __profile_flip_buffers(void *unused)
 {
@@ -305,14 +304,12 @@ static void profile_discard_flip_buffers(void)
 	mutex_unlock(&profile_flip_mutex);
 }
 
-void profile_hits(int type, void *__pc, unsigned int nr_hits)
+static void do_profile_hits(int type, void *__pc, unsigned int nr_hits)
 {
 	unsigned long primary, secondary, flags, pc = (unsigned long)__pc;
 	int i, j, cpu;
 	struct profile_hit *hits;
 
-	if (prof_on != type || !prof_buffer)
-		return;
 	pc = min((pc - (unsigned long)_stext) >> prof_shift, prof_len - 1);
 	i = primary = (pc & (NR_PROFILE_GRP - 1)) << PROFILE_GRPSHIFT;
 	secondary = (~(pc << 1) & (NR_PROFILE_GRP - 1)) << PROFILE_GRPSHIFT;
@@ -419,16 +416,20 @@ out_free:
 #define profile_discard_flip_buffers()	do { } while (0)
 #define profile_cpu_callback		NULL
 
-void profile_hits(int type, void *__pc, unsigned int nr_hits)
+static void do_profile_hits(int type, void *__pc, unsigned int nr_hits)
 {
 	unsigned long pc;
-
-	if (prof_on != type || !prof_buffer)
-		return;
 	pc = ((unsigned long)__pc - (unsigned long)_stext) >> prof_shift;
 	atomic_add(nr_hits, &prof_buffer[min(pc, prof_len - 1)]);
 }
 #endif /* !CONFIG_SMP */
+
+void profile_hits(int type, void *__pc, unsigned int nr_hits)
+{
+	if (prof_on != type || !prof_buffer)
+		return;
+	do_profile_hits(type, __pc, nr_hits);
+}
 EXPORT_SYMBOL_GPL(profile_hits);
 
 void profile_tick(int type)

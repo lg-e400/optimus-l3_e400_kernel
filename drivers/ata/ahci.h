@@ -35,6 +35,7 @@
 #ifndef _AHCI_H
 #define _AHCI_H
 
+#include <linux/clk.h>
 #include <linux/libata.h>
 
 /* Enclosure Management Control */
@@ -115,6 +116,9 @@ enum {
 	HOST_CAP2_BOH		= (1 << 0),  /* BIOS/OS handoff supported */
 	HOST_CAP2_NVMHCI	= (1 << 1),  /* NVMHCI supported */
 	HOST_CAP2_APST		= (1 << 2),  /* Automatic partial to slumber */
+	HOST_CAP2_SDS		= (1 << 3),  /* Support device sleep */
+	HOST_CAP2_SADM		= (1 << 4),  /* Support aggressive DevSlp */
+	HOST_CAP2_DESO		= (1 << 5),  /* DevSlp from slumber only */
 
 	/* registers for each SATA port */
 	PORT_LST_ADDR		= 0x00, /* command list DMA addr */
@@ -133,6 +137,7 @@ enum {
 	PORT_SCR_ACT		= 0x34, /* SATA phy register: SActive */
 	PORT_SCR_NTF		= 0x3c, /* SATA phy register: SNotification */
 	PORT_FBS		= 0x40, /* FIS-based Switching */
+	PORT_DEVSLP		= 0x44, /* device sleep */
 
 	/* PORT_IRQ_{STAT,MASK} bits */
 	PORT_IRQ_COLD_PRES	= (1 << 31), /* cold presence detect */
@@ -186,6 +191,7 @@ enum {
 	PORT_CMD_ICC_PARTIAL	= (0x2 << 28), /* Put i/f in partial state */
 	PORT_CMD_ICC_SLUMBER	= (0x6 << 28), /* Put i/f in slumber state */
 
+	/* PORT_FBS bits */
 	PORT_FBS_DWE_OFFSET	= 16, /* FBS device with error offset */
 	PORT_FBS_ADO_OFFSET	= 12, /* FBS active dev optimization offset */
 	PORT_FBS_DEV_OFFSET	= 8,  /* FBS device to issue offset */
@@ -194,7 +200,19 @@ enum {
 	PORT_FBS_DEC		= (1 << 1), /* FBS device error clear */
 	PORT_FBS_EN		= (1 << 0), /* Enable FBS */
 
+	/* PORT_DEVSLP bits */
+	PORT_DEVSLP_DM_OFFSET	= 25,             /* DITO multiplier offset */
+	PORT_DEVSLP_DM_MASK	= (0xf << 25),    /* DITO multiplier mask */
+	PORT_DEVSLP_DITO_OFFSET	= 15,             /* DITO offset */
+	PORT_DEVSLP_MDAT_OFFSET	= 10,             /* Minimum assertion time */
+	PORT_DEVSLP_DETO_OFFSET	= 2,              /* DevSlp exit timeout */
+	PORT_DEVSLP_DSP		= (1 << 1),       /* DevSlp present */
+	PORT_DEVSLP_ADSE	= (1 << 0),       /* Aggressive DevSlp enable */
+
 	/* hpriv->flags bits */
+
+#define AHCI_HFLAGS(flags)		.private_data	= (void *)(flags)
+
 	AHCI_HFLAG_NO_NCQ		= (1 << 0),
 	AHCI_HFLAG_IGN_IRQ_IF_ERR	= (1 << 1), /* ignore IRQ_IF_ERR */
 	AHCI_HFLAG_IGN_SERR_INTERNAL	= (1 << 2), /* ignore SERR_INTERNAL */
@@ -210,13 +228,14 @@ enum {
 	AHCI_HFLAG_NO_SNTF		= (1 << 12), /* no sntf */
 	AHCI_HFLAG_NO_FPDMA_AA		= (1 << 13), /* no FPDMA AA */
 	AHCI_HFLAG_YES_FBS		= (1 << 14), /* force FBS cap on */
+	AHCI_HFLAG_DELAY_ENGINE		= (1 << 15), /* do not start engine on
+						        port start (wait until
+						        error-handling stage) */
 
 	/* ap->flags bits */
 
-	AHCI_FLAG_COMMON		= ATA_FLAG_SATA | ATA_FLAG_NO_LEGACY |
-					  ATA_FLAG_MMIO | ATA_FLAG_PIO_DMA |
-					  ATA_FLAG_ACPI_SATA | ATA_FLAG_AN |
-					  ATA_FLAG_LPM,
+	AHCI_FLAG_COMMON		= ATA_FLAG_SATA | ATA_FLAG_PIO_DMA |
+					  ATA_FLAG_ACPI_SATA | ATA_FLAG_AN,
 
 	ICH_MAP				= 0x90, /* ICH MAP register */
 
@@ -227,10 +246,14 @@ enum {
 	/* em_ctl bits */
 	EM_CTL_RST		= (1 << 9), /* Reset */
 	EM_CTL_TM		= (1 << 8), /* Transmit Message */
-	EM_CTL_MR		= (1 << 0), /* Message Recieved */
+	EM_CTL_MR		= (1 << 0), /* Message Received */
 	EM_CTL_ALHD		= (1 << 26), /* Activity LED */
 	EM_CTL_XMT		= (1 << 25), /* Transmit Only */
 	EM_CTL_SMB		= (1 << 24), /* Single Message Buffer */
+	EM_CTL_SGPIO		= (1 << 19), /* SGPIO messages supported */
+	EM_CTL_SES		= (1 << 18), /* SES-2 messages supported */
+	EM_CTL_SAFTE		= (1 << 17), /* SAF-TE messages supported */
+	EM_CTL_LED		= (1 << 16), /* LED messages supported */
 
 	/* em message type */
 	EM_MSG_TYPE_LED		= (1 << 0), /* LED */
@@ -283,7 +306,7 @@ struct ahci_port_priv {
 };
 
 struct ahci_host_priv {
-	void __iomem *		mmio;		/* bus-independant mem map */
+	void __iomem *		mmio;		/* bus-independent mem map */
 	unsigned int		flags;		/* AHCI_HFLAG_* */
 	u32			cap;		/* cap to use */
 	u32			cap2;		/* cap2 to use */
@@ -294,6 +317,7 @@ struct ahci_host_priv {
 	u32 			em_loc; /* enclosure management location */
 	u32			em_buf_sz;	/* EM buffer size in byte */
 	u32			em_msg_type;	/* EM message type */
+	struct clk		*clk;		/* Only for platforms supporting clk */
 };
 
 extern int ahci_ignore_sss;
@@ -310,7 +334,9 @@ extern struct device_attribute *ahci_sdev_attrs[];
 	.sdev_attrs		= ahci_sdev_attrs
 
 extern struct ata_port_operations ahci_ops;
+extern struct ata_port_operations ahci_pmp_retry_srst_ops;
 
+unsigned int ahci_dev_classify(struct ata_port *ap);
 void ahci_fill_cmd_slot(struct ahci_port_priv *pp, unsigned int tag,
 			u32 opts);
 void ahci_save_initial_config(struct device *dev,

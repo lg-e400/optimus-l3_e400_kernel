@@ -116,9 +116,6 @@ static int pmic8xxx_kp_write_u8(struct pmic8xxx_kp *kp,
 	int rc;
 
 	rc = pm8xxx_writeb(kp->dev->parent, reg, data);
-	if (rc < 0)
-		dev_warn(kp->dev, "Error writing pmic8xxx: %X - ret %X\n",
-				reg, rc);
 	return rc;
 }
 
@@ -128,10 +125,6 @@ static int pmic8xxx_kp_read(struct pmic8xxx_kp *kp,
 	int rc;
 
 	rc = pm8xxx_read_buf(kp->dev->parent, reg, data, num_bytes);
-	if (rc < 0)
-		dev_warn(kp->dev, "Error reading pmic8xxx: %X - ret %X\n",
-				reg, rc);
-
 	return rc;
 }
 
@@ -141,9 +134,6 @@ static int pmic8xxx_kp_read_u8(struct pmic8xxx_kp *kp,
 	int rc;
 
 	rc = pmic8xxx_kp_read(kp, data, reg, 1);
-	if (rc < 0)
-		dev_warn(kp->dev, "Error reading pmic8xxx: %X - ret %X\n",
-				reg, rc);
 	return rc;
 }
 
@@ -174,14 +164,18 @@ static int pmic8xxx_chk_sync_read(struct pmic8xxx_kp *kp)
 	u8 scan_val;
 
 	rc = pmic8xxx_kp_read_u8(kp, &scan_val, KEYP_SCAN);
-	if (rc < 0)
+	if (rc < 0) {
+		dev_err(kp->dev, "Error reading KEYP_SCAN reg, rc=%d\n", rc);
 		return rc;
+	}
 
 	scan_val |= 0x1;
 
 	rc = pmic8xxx_kp_write_u8(kp, scan_val, KEYP_SCAN);
-	if (rc < 0)
+	if (rc < 0) {
+		dev_err(kp->dev, "Error writing KEYP_SCAN reg, rc=%d\n", rc);
 		return rc;
+	}
 
 	/* 2 * 32KHz clocks */
 	udelay((2 * DIV_ROUND_UP(USEC_PER_SEC, KEYP_CLOCK_FREQ)) + 1);
@@ -224,25 +218,34 @@ static int pmic8xxx_kp_read_matrix(struct pmic8xxx_kp *kp, u16 *new_state,
 	if (old_state) {
 		rc = pmic8xxx_kp_read_data(kp, old_state, KEYP_OLD_DATA,
 						read_rows);
-		if (rc < 0)
+		if (rc < 0) {
+			dev_err(kp->dev,
+				"Error reading KEYP_OLD_DATA, rc=%d\n", rc);
 			return rc;
+		}
 	}
 
 	rc = pmic8xxx_kp_read_data(kp, new_state, KEYP_RECENT_DATA,
 					 read_rows);
-	if (rc < 0)
+	if (rc < 0) {
+		dev_err(kp->dev,
+			"Error reading KEYP_RECENT_DATA, rc=%d\n", rc);
 		return rc;
+	}
 
 	/* 4 * 32KHz clocks */
 	udelay((4 * DIV_ROUND_UP(USEC_PER_SEC, KEYP_CLOCK_FREQ)) + 1);
 
 	rc = pmic8xxx_kp_read_u8(kp, &scan_val, KEYP_SCAN);
-	if (rc < 0)
+	if (rc < 0) {
+		dev_err(kp->dev, "Error reading KEYP_SCAN reg, rc=%d\n", rc);
 		return rc;
+	}
+
 	scan_val &= 0xFE;
 	rc = pmic8xxx_kp_write_u8(kp, scan_val, KEYP_SCAN);
 	if (rc < 0)
-		return rc;
+		dev_err(kp->dev, "Error writing KEYP_SCAN reg, rc=%d\n", rc);
 
 	return rc;
 }
@@ -419,8 +422,10 @@ static int pmic8xxx_kpd_init(struct pmic8xxx_kp *kp)
 	ctrl_val |= (bits << KEYP_CTRL_SCAN_ROWS_SHIFT);
 
 	rc = pmic8xxx_kp_write_u8(kp, ctrl_val, KEYP_CTRL);
-	if (rc < 0)
+	if (rc < 0) {
+		dev_err(kp->dev, "Error writing KEYP_CTRL reg, rc=%d\n", rc);
 		return rc;
+	}
 
 	bits = (kp->pdata->debounce_ms / 5) - 1;
 
@@ -435,12 +440,14 @@ static int pmic8xxx_kpd_init(struct pmic8xxx_kp *kp)
 	scan_val |= (cycles << KEYP_SCAN_ROW_HOLD_SHIFT);
 
 	rc = pmic8xxx_kp_write_u8(kp, scan_val, KEYP_SCAN);
+	if (rc)
+		dev_err(kp->dev, "Error writing KEYP_SCAN reg, rc=%d\n", rc);
 
 	return rc;
 
 }
 
-static int  __devinit pmic8xxx_kp_config_gpio(int gpio_start, int num_gpios,
+static int  pmic8xxx_kp_config_gpio(int gpio_start, int num_gpios,
 			struct pmic8xxx_kp *kp, struct pm_gpio *gpio_config)
 {
 	int	rc, i;
@@ -456,7 +463,7 @@ static int  __devinit pmic8xxx_kp_config_gpio(int gpio_start, int num_gpios,
 					__func__, gpio_start + i, rc);
 			return rc;
 		}
-	}
+	 }
 
 	return 0;
 }
@@ -469,7 +476,7 @@ static int pmic8xxx_kp_enable(struct pmic8xxx_kp *kp)
 
 	rc = pmic8xxx_kp_write_u8(kp, kp->ctrl_reg, KEYP_CTRL);
 	if (rc < 0)
-		return rc;
+		dev_err(kp->dev, "Error writing KEYP_CTRL reg, rc=%d\n", rc);
 
 	return rc;
 }
@@ -511,10 +518,10 @@ static void pmic8xxx_kp_close(struct input_dev *dev)
  * - set irq edge type.
  * - enable the keypad controller.
  */
-static int __devinit pmic8xxx_kp_probe(struct platform_device *pdev)
+static int pmic8xxx_kp_probe(struct platform_device *pdev)
 {
 	const struct pm8xxx_keypad_platform_data *pdata =
-						pdev->dev.platform_data;
+					dev_get_platdata(&pdev->dev);
 	const struct matrix_keymap_data *keymap_data;
 	struct pmic8xxx_kp *kp;
 	int rc;
@@ -525,7 +532,7 @@ static int __devinit pmic8xxx_kp_probe(struct platform_device *pdev)
 		.output_buffer	= PM_GPIO_OUT_BUF_OPEN_DRAIN,
 		.output_value	= 0,
 		.pull		= PM_GPIO_PULL_NO,
-		.vin_sel	= PM_GPIO_VIN_S4,
+		.vin_sel	= PM_GPIO_VIN_S3,
 		.out_strength	= PM_GPIO_STRENGTH_LOW,
 		.function	= PM_GPIO_FUNC_1,
 		.inv_int_pol	= 1,
@@ -534,7 +541,7 @@ static int __devinit pmic8xxx_kp_probe(struct platform_device *pdev)
 	struct pm_gpio kypd_sns = {
 		.direction	= PM_GPIO_DIR_IN,
 		.pull		= PM_GPIO_PULL_UP_31P5,
-		.vin_sel	= PM_GPIO_VIN_S4,
+		.vin_sel	= PM_GPIO_VIN_S3,
 		.out_strength	= PM_GPIO_STRENGTH_NO,
 		.function	= PM_GPIO_FUNC_NORMAL,
 		.inv_int_pol	= 1,
@@ -558,7 +565,7 @@ static int __devinit pmic8xxx_kp_probe(struct platform_device *pdev)
 	}
 
 	if (!pdata->row_hold_ns ||
-	    pdata->row_hold_ns > MAX_ROW_HOLD_DELAY ||
+		pdata->row_hold_ns > MAX_ROW_HOLD_DELAY ||
 		pdata->row_hold_ns < MIN_ROW_HOLD_DELAY ||
 		((pdata->row_hold_ns % MIN_ROW_HOLD_DELAY) != 0)) {
 		dev_err(&pdev->dev, "invalid keypad row hold time supplied\n");
@@ -619,21 +626,21 @@ static int __devinit pmic8xxx_kp_probe(struct platform_device *pdev)
 	kp->input->id.product	= 0x0001;
 	kp->input->id.vendor	= 0x0001;
 
-	kp->input->evbit[0]	= BIT_MASK(EV_KEY);
-
-	if (pdata->rep)
-		__set_bit(EV_REP, kp->input->evbit);
-
-	kp->input->keycode	= kp->keycodes;
-	kp->input->keycodemax	= PM8XXX_MATRIX_MAX_SIZE;
-	kp->input->keycodesize	= sizeof(kp->keycodes);
 	kp->input->open		= pmic8xxx_kp_open;
 	kp->input->close	= pmic8xxx_kp_close;
 
-	matrix_keypad_build_keymap(keymap_data, PM8XXX_ROW_SHIFT,
-					kp->input->keycode, kp->input->keybit);
+	rc = matrix_keypad_build_keymap(keymap_data, NULL,
+					PM8XXX_MAX_ROWS, PM8XXX_MAX_COLS,
+					kp->keycodes, kp->input);
+	if (rc) {
+		dev_err(&pdev->dev, "failed to build keymap\n");
+		goto err_get_irq;
+	}
 
+	if (pdata->rep)
+		__set_bit(EV_REP, kp->input->evbit);
 	input_set_capability(kp->input, EV_MSC, MSC_SCAN);
+
 	input_set_drvdata(kp->input, kp);
 
 	/* initialize keypad state */
@@ -693,9 +700,9 @@ static int __devinit pmic8xxx_kp_probe(struct platform_device *pdev)
 	return 0;
 
 err_pmic_reg_read:
-	free_irq(kp->key_stuck_irq, NULL);
+	free_irq(kp->key_stuck_irq, kp);
 err_req_stuck_irq:
-	free_irq(kp->key_sense_irq, NULL);
+	free_irq(kp->key_sense_irq, kp);
 err_gpio_config:
 err_get_irq:
 	input_free_device(kp->input);
@@ -705,13 +712,13 @@ err_alloc_device:
 	return rc;
 }
 
-static int __devexit pmic8xxx_kp_remove(struct platform_device *pdev)
+static int pmic8xxx_kp_remove(struct platform_device *pdev)
 {
 	struct pmic8xxx_kp *kp = platform_get_drvdata(pdev);
 
 	device_init_wakeup(&pdev->dev, 0);
-	free_irq(kp->key_stuck_irq, NULL);
-	free_irq(kp->key_sense_irq, NULL);
+	free_irq(kp->key_stuck_irq, kp);
+	free_irq(kp->key_sense_irq, kp);
 	input_unregister_device(kp->input);
 	kfree(kp);
 
@@ -766,27 +773,17 @@ static SIMPLE_DEV_PM_OPS(pm8xxx_kp_pm_ops,
 
 static struct platform_driver pmic8xxx_kp_driver = {
 	.probe		= pmic8xxx_kp_probe,
-	.remove		= __devexit_p(pmic8xxx_kp_remove),
+	.remove		= pmic8xxx_kp_remove,
 	.driver		= {
 		.name = PM8XXX_KEYPAD_DEV_NAME,
 		.owner = THIS_MODULE,
 		.pm = &pm8xxx_kp_pm_ops,
 	},
 };
-
-static int __init pmic8xxx_kp_init(void)
-{
-	return platform_driver_register(&pmic8xxx_kp_driver);
-}
-module_init(pmic8xxx_kp_init);
-
-static void __exit pmic8xxx_kp_exit(void)
-{
-	platform_driver_unregister(&pmic8xxx_kp_driver);
-}
-module_exit(pmic8xxx_kp_exit);
+module_platform_driver(pmic8xxx_kp_driver);
 
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("PMIC8XXX keypad driver");
 MODULE_VERSION("1.0");
 MODULE_ALIAS("platform:pmic8xxx_keypad");
+MODULE_AUTHOR("Trilok Soni <tsoni@codeaurora.org>");

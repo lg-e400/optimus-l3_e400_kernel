@@ -20,9 +20,9 @@
  * write would be discarded and things quickly fall apart.
  *
  * To keep this delay from significantly degrading performance (we, in theory,
- * would have to sleep for up to 1 second everytime we wanted to write a
+ * would have to sleep for up to 1 second every time we wanted to write a
  * register), we only check the write pending status before we start to issue
- * a new write.  We bank on the idea that it doesnt matter when the sync
+ * a new write.  We bank on the idea that it doesn't matter when the sync
  * happens so long as we don't attempt another write before it does.  The only
  * time userspace would take this penalty is when they try and do multiple
  * operations right after another ... but in this case, they need to take the
@@ -240,32 +240,6 @@ static void bfin_rtc_int_set_alarm(struct bfin_rtc *rtc)
 	 */
 	bfin_rtc_int_set(rtc->rtc_alarm.tm_yday == -1 ? RTC_ISTAT_ALARM : RTC_ISTAT_ALARM_DAY);
 }
-static int bfin_rtc_ioctl(struct device *dev, unsigned int cmd, unsigned long arg)
-{
-	struct bfin_rtc *rtc = dev_get_drvdata(dev);
-	int ret = 0;
-
-	dev_dbg_stamp(dev);
-
-	bfin_rtc_sync_pending(dev);
-
-	switch (cmd) {
-	case RTC_UIE_ON:
-		dev_dbg_stamp(dev);
-		bfin_rtc_int_set(RTC_ISTAT_SEC);
-		break;
-	case RTC_UIE_OFF:
-		dev_dbg_stamp(dev);
-		bfin_rtc_int_clear(~RTC_ISTAT_SEC);
-		break;
-
-	default:
-		dev_dbg_stamp(dev);
-		ret = -ENOIOCTLCMD;
-	}
-
-	return ret;
-}
 
 static int bfin_rtc_alarm_irq_enable(struct device *dev, unsigned int enabled)
 {
@@ -360,7 +334,6 @@ static int bfin_rtc_proc(struct device *dev, struct seq_file *seq)
 }
 
 static struct rtc_class_ops bfin_rtc_ops = {
-	.ioctl         = bfin_rtc_ioctl,
 	.read_time     = bfin_rtc_read_time,
 	.set_time      = bfin_rtc_set_time,
 	.read_alarm    = bfin_rtc_read_alarm,
@@ -369,7 +342,7 @@ static struct rtc_class_ops bfin_rtc_ops = {
 	.alarm_irq_enable = bfin_rtc_alarm_irq_enable,
 };
 
-static int __devinit bfin_rtc_probe(struct platform_device *pdev)
+static int bfin_rtc_probe(struct platform_device *pdev)
 {
 	struct bfin_rtc *rtc;
 	struct device *dev = &pdev->dev;
@@ -415,7 +388,7 @@ err:
 	return ret;
 }
 
-static int __devexit bfin_rtc_remove(struct platform_device *pdev)
+static int bfin_rtc_remove(struct platform_device *pdev)
 {
 	struct bfin_rtc *rtc = platform_get_drvdata(pdev);
 	struct device *dev = &pdev->dev;
@@ -478,23 +451,12 @@ static struct platform_driver bfin_rtc_driver = {
 		.owner	= THIS_MODULE,
 	},
 	.probe		= bfin_rtc_probe,
-	.remove		= __devexit_p(bfin_rtc_remove),
+	.remove		= bfin_rtc_remove,
 	.suspend	= bfin_rtc_suspend,
 	.resume		= bfin_rtc_resume,
 };
 
-static int __init bfin_rtc_init(void)
-{
-	return platform_driver_register(&bfin_rtc_driver);
-}
-
-static void __exit bfin_rtc_exit(void)
-{
-	platform_driver_unregister(&bfin_rtc_driver);
-}
-
-module_init(bfin_rtc_init);
-module_exit(bfin_rtc_exit);
+module_platform_driver(bfin_rtc_driver);
 
 MODULE_DESCRIPTION("Blackfin On-Chip Real Time Clock Driver");
 MODULE_AUTHOR("Mike Frysinger <vapier@gentoo.org>");

@@ -35,7 +35,7 @@
  *
  * On 32-bit CPUs an optimized representation of the timespec structure
  * is used to avoid expensive conversions from and to timespecs. The
- * endian-aware order of the tv struct members is choosen to allow
+ * endian-aware order of the tv struct members is chosen to allow
  * mathematical operations on the tv64 member of the union too, which
  * for certain operations produces better code.
  *
@@ -57,13 +57,6 @@ union ktime {
 };
 
 typedef union ktime ktime_t;		/* Kill this */
-
-#define KTIME_MAX			((s64)~((u64)1 << 63))
-#if (BITS_PER_LONG == 64)
-# define KTIME_SEC_MAX			(KTIME_MAX / NSEC_PER_SEC)
-#else
-# define KTIME_SEC_MAX			LONG_MAX
-#endif
 
 /*
  * ktime_t definitions when using the 64-bit scalar representation:
@@ -150,14 +143,7 @@ static inline ktime_t timeval_to_ktime(struct timeval tv)
 /* Set a ktime_t variable to a value in sec/nsec representation: */
 static inline ktime_t ktime_set(const long secs, const unsigned long nsecs)
 {
-#ifdef __SPLINT__
-	ktime_t time;
-	time.tv.sec = secs;
-	time.tv.nsec = nsecs;
-	return time;
-#else
 	return (ktime_t) { .tv = { .sec = secs, .nsec = nsecs } };
-#endif
 }
 
 /**
@@ -165,7 +151,7 @@ static inline ktime_t ktime_set(const long secs, const unsigned long nsecs)
  * @lhs:	minuend
  * @rhs:	subtrahend
  *
- * Returns the remainder of the substraction
+ * Returns the remainder of the subtraction
  */
 static inline ktime_t ktime_sub(const ktime_t lhs, const ktime_t rhs)
 {
@@ -230,15 +216,8 @@ extern ktime_t ktime_sub_ns(const ktime_t kt, u64 nsec);
  */
 static inline ktime_t timespec_to_ktime(const struct timespec ts)
 {
-#ifdef __SPLINT__
-	ktime_t time;
-	time.tv.sec = (s32)ts.tv_sec;
-	time.tv.nsec = (s32)ts.tv_nsec;
-	return time;
-#else
 	return (ktime_t) { .tv = { .sec = (s32)ts.tv_sec,
 			   	   .nsec = (s32)ts.tv_nsec } };
-#endif
 }
 
 /**
@@ -249,15 +228,8 @@ static inline ktime_t timespec_to_ktime(const struct timespec ts)
  */
 static inline ktime_t timeval_to_ktime(const struct timeval tv)
 {
-#ifdef __SPLINT__
-	ktime_t time;
-	time.tv.sec = (s32)tv.tv_sec;
-	time.tv.nsec = (s32)tv.tv_nsec;
-	return time;
-#else
 	return (ktime_t) { .tv = { .sec = (s32)tv.tv_sec,
 				   .nsec = (s32)tv.tv_usec * 1000 } };
-#endif
 }
 
 /**
@@ -268,15 +240,8 @@ static inline ktime_t timeval_to_ktime(const struct timeval tv)
  */
 static inline struct timespec ktime_to_timespec(const ktime_t kt)
 {
-#ifdef __SPLINT__
-	struct timespec time_spec;
-	time_spec.tv_sec = (time_t)kt.tv.sec;
-	time_spec.tv_nsec = (long)kt.tv.nsec;
-	return time_spec;
-#else
 	return (struct timespec) { .tv_sec = (time_t) kt.tv.sec,
 				   .tv_nsec = (long) kt.tv.nsec };
-#endif
 }
 
 /**
@@ -287,16 +252,9 @@ static inline struct timespec ktime_to_timespec(const ktime_t kt)
  */
 static inline struct timeval ktime_to_timeval(const ktime_t kt)
 {
-#ifdef __SPLINT__
-	struct timeval time_val;
-	time_val.tv_sec = (time_t) kt.tv.sec;
-	time_val.tv_usec = (suseconds_t) (kt.tv.nsec / NSEC_PER_USEC);
-	return time_val;
-#else
 	return (struct timeval) {
 		.tv_sec = (time_t) kt.tv.sec,
 		.tv_usec = (suseconds_t) (kt.tv.nsec / NSEC_PER_USEC) };
-#endif
 }
 
 /**
@@ -322,6 +280,25 @@ static inline s64 ktime_to_ns(const ktime_t kt)
 static inline int ktime_equal(const ktime_t cmp1, const ktime_t cmp2)
 {
 	return cmp1.tv64 == cmp2.tv64;
+}
+
+/**
+ * ktime_compare - Compares two ktime_t variables for less, greater or equal
+ * @cmp1:	comparable1
+ * @cmp2:	comparable2
+ *
+ * Returns ...
+ *   cmp1  < cmp2: return <0
+ *   cmp1 == cmp2: return 0
+ *   cmp1  > cmp2: return >0
+ */
+static inline int ktime_compare(const ktime_t cmp1, const ktime_t cmp2)
+{
+	if (cmp1.tv64 < cmp2.tv64)
+		return -1;
+	if (cmp1.tv64 > cmp2.tv64)
+		return 1;
+	return 0;
 }
 
 static inline s64 ktime_to_us(const ktime_t kt)

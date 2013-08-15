@@ -60,14 +60,15 @@ int rt2x00pci_regbusy_read(struct rt2x00_dev *rt2x00dev,
 }
 EXPORT_SYMBOL_GPL(rt2x00pci_regbusy_read);
 
-void rt2x00pci_rxdone(struct rt2x00_dev *rt2x00dev)
+bool rt2x00pci_rxdone(struct rt2x00_dev *rt2x00dev)
 {
 	struct data_queue *queue = rt2x00dev->rx;
 	struct queue_entry *entry;
 	struct queue_entry_priv_pci *entry_priv;
 	struct skb_frame_desc *skbdesc;
+	int max_rx = 16;
 
-	while (1) {
+	while (--max_rx) {
 		entry = rt2x00queue_get_entry(queue, Q_INDEX);
 		entry_priv = entry->priv_data;
 
@@ -91,10 +92,21 @@ void rt2x00pci_rxdone(struct rt2x00_dev *rt2x00dev)
 		/*
 		 * Send the frame to rt2x00lib for further processing.
 		 */
-		rt2x00lib_rxdone(entry);
+		rt2x00lib_rxdone(entry, GFP_ATOMIC);
 	}
+
+	return !max_rx;
 }
 EXPORT_SYMBOL_GPL(rt2x00pci_rxdone);
+
+void rt2x00pci_flush_queue(struct data_queue *queue, bool drop)
+{
+	unsigned int i;
+
+	for (i = 0; !rt2x00queue_empty(queue) && i < 10; i++)
+		msleep(10);
+}
+EXPORT_SYMBOL_GPL(rt2x00pci_flush_queue);
 
 /*
  * Device initialization handlers.
@@ -160,10 +172,9 @@ int rt2x00pci_initialize(struct rt2x00_dev *rt2x00dev)
 	/*
 	 * Register interrupt handler.
 	 */
-	status = request_threaded_irq(rt2x00dev->irq,
-				      rt2x00dev->ops->lib->irq_handler,
-				      rt2x00dev->ops->lib->irq_handler_thread,
-				      IRQF_SHARED, rt2x00dev->name, rt2x00dev);
+	status = request_irq(rt2x00dev->irq,
+			     rt2x00dev->ops->lib->irq_handler,
+			     IRQF_SHARED, rt2x00dev->name, rt2x00dev);
 	if (status) {
 		ERROR(rt2x00dev, "IRQ %d allocation failed (error %d).\n",
 		      rt2x00dev->irq, status);
@@ -240,12 +251,12 @@ exit:
 	return -ENOMEM;
 }
 
-int rt2x00pci_probe(struct pci_dev *pci_dev, const struct pci_device_id *id)
+int rt2x00pci_probe(struct pci_dev *pci_dev, const struct rt2x00_ops *ops)
 {
-	struct rt2x00_ops *ops = (struct rt2x00_ops *)id->driver_data;
 	struct ieee80211_hw *hw;
 	struct rt2x00_dev *rt2x00dev;
 	int retval;
+	u16 chip;
 
 	retval = pci_enable_device(pci_dev);
 	if (retval) {
@@ -294,6 +305,14 @@ int rt2x00pci_probe(struct pci_dev *pci_dev, const struct pci_device_id *id)
 	retval = rt2x00pci_alloc_reg(rt2x00dev);
 	if (retval)
 		goto exit_free_device;
+
+	/*
+	 * Because rt3290 chip use different efuse offset to read efuse data.
+	 * So before read efuse it need to indicate it is the
+	 * rt3290 or not.
+	 */
+	pci_read_config_word(pci_dev, PCI_DEVICE_ID, &chip);
+	rt2x00dev->chip.rt = chip;
 
 	retval = rt2x00lib_probe_dev(rt2x00dev);
 	if (retval)

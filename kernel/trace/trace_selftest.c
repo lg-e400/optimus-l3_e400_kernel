@@ -101,13 +101,225 @@ static inline void warn_failed_init_tracer(struct tracer *trace, int init_ret)
 
 #ifdef CONFIG_DYNAMIC_FTRACE
 
+static int trace_selftest_test_probe1_cnt;
+static void trace_selftest_test_probe1_func(unsigned long ip,
+					    unsigned long pip,
+					    struct ftrace_ops *op,
+					    struct pt_regs *pt_regs)
+{
+	trace_selftest_test_probe1_cnt++;
+}
+
+static int trace_selftest_test_probe2_cnt;
+static void trace_selftest_test_probe2_func(unsigned long ip,
+					    unsigned long pip,
+					    struct ftrace_ops *op,
+					    struct pt_regs *pt_regs)
+{
+	trace_selftest_test_probe2_cnt++;
+}
+
+static int trace_selftest_test_probe3_cnt;
+static void trace_selftest_test_probe3_func(unsigned long ip,
+					    unsigned long pip,
+					    struct ftrace_ops *op,
+					    struct pt_regs *pt_regs)
+{
+	trace_selftest_test_probe3_cnt++;
+}
+
+static int trace_selftest_test_global_cnt;
+static void trace_selftest_test_global_func(unsigned long ip,
+					    unsigned long pip,
+					    struct ftrace_ops *op,
+					    struct pt_regs *pt_regs)
+{
+	trace_selftest_test_global_cnt++;
+}
+
+static int trace_selftest_test_dyn_cnt;
+static void trace_selftest_test_dyn_func(unsigned long ip,
+					 unsigned long pip,
+					 struct ftrace_ops *op,
+					 struct pt_regs *pt_regs)
+{
+	trace_selftest_test_dyn_cnt++;
+}
+
+static struct ftrace_ops test_probe1 = {
+	.func			= trace_selftest_test_probe1_func,
+	.flags			= FTRACE_OPS_FL_RECURSION_SAFE,
+};
+
+static struct ftrace_ops test_probe2 = {
+	.func			= trace_selftest_test_probe2_func,
+	.flags			= FTRACE_OPS_FL_RECURSION_SAFE,
+};
+
+static struct ftrace_ops test_probe3 = {
+	.func			= trace_selftest_test_probe3_func,
+	.flags			= FTRACE_OPS_FL_RECURSION_SAFE,
+};
+
+static struct ftrace_ops test_global = {
+	.func		= trace_selftest_test_global_func,
+	.flags		= FTRACE_OPS_FL_GLOBAL | FTRACE_OPS_FL_RECURSION_SAFE,
+};
+
+static void print_counts(void)
+{
+	printk("(%d %d %d %d %d) ",
+	       trace_selftest_test_probe1_cnt,
+	       trace_selftest_test_probe2_cnt,
+	       trace_selftest_test_probe3_cnt,
+	       trace_selftest_test_global_cnt,
+	       trace_selftest_test_dyn_cnt);
+}
+
+static void reset_counts(void)
+{
+	trace_selftest_test_probe1_cnt = 0;
+	trace_selftest_test_probe2_cnt = 0;
+	trace_selftest_test_probe3_cnt = 0;
+	trace_selftest_test_global_cnt = 0;
+	trace_selftest_test_dyn_cnt = 0;
+}
+
+static int trace_selftest_ops(int cnt)
+{
+	int save_ftrace_enabled = ftrace_enabled;
+	struct ftrace_ops *dyn_ops;
+	char *func1_name;
+	char *func2_name;
+	int len1;
+	int len2;
+	int ret = -1;
+
+	printk(KERN_CONT "PASSED\n");
+	pr_info("Testing dynamic ftrace ops #%d: ", cnt);
+
+	ftrace_enabled = 1;
+	reset_counts();
+
+	/* Handle PPC64 '.' name */
+	func1_name = "*" __stringify(DYN_FTRACE_TEST_NAME);
+	func2_name = "*" __stringify(DYN_FTRACE_TEST_NAME2);
+	len1 = strlen(func1_name);
+	len2 = strlen(func2_name);
+
+	/*
+	 * Probe 1 will trace function 1.
+	 * Probe 2 will trace function 2.
+	 * Probe 3 will trace functions 1 and 2.
+	 */
+	ftrace_set_filter(&test_probe1, func1_name, len1, 1);
+	ftrace_set_filter(&test_probe2, func2_name, len2, 1);
+	ftrace_set_filter(&test_probe3, func1_name, len1, 1);
+	ftrace_set_filter(&test_probe3, func2_name, len2, 0);
+
+	register_ftrace_function(&test_probe1);
+	register_ftrace_function(&test_probe2);
+	register_ftrace_function(&test_probe3);
+	register_ftrace_function(&test_global);
+
+	DYN_FTRACE_TEST_NAME();
+
+	print_counts();
+
+	if (trace_selftest_test_probe1_cnt != 1)
+		goto out;
+	if (trace_selftest_test_probe2_cnt != 0)
+		goto out;
+	if (trace_selftest_test_probe3_cnt != 1)
+		goto out;
+	if (trace_selftest_test_global_cnt == 0)
+		goto out;
+
+	DYN_FTRACE_TEST_NAME2();
+
+	print_counts();
+
+	if (trace_selftest_test_probe1_cnt != 1)
+		goto out;
+	if (trace_selftest_test_probe2_cnt != 1)
+		goto out;
+	if (trace_selftest_test_probe3_cnt != 2)
+		goto out;
+
+	/* Add a dynamic probe */
+	dyn_ops = kzalloc(sizeof(*dyn_ops), GFP_KERNEL);
+	if (!dyn_ops) {
+		printk("MEMORY ERROR ");
+		goto out;
+	}
+
+	dyn_ops->func = trace_selftest_test_dyn_func;
+
+	register_ftrace_function(dyn_ops);
+
+	trace_selftest_test_global_cnt = 0;
+
+	DYN_FTRACE_TEST_NAME();
+
+	print_counts();
+
+	if (trace_selftest_test_probe1_cnt != 2)
+		goto out_free;
+	if (trace_selftest_test_probe2_cnt != 1)
+		goto out_free;
+	if (trace_selftest_test_probe3_cnt != 3)
+		goto out_free;
+	if (trace_selftest_test_global_cnt == 0)
+		goto out;
+	if (trace_selftest_test_dyn_cnt == 0)
+		goto out_free;
+
+	DYN_FTRACE_TEST_NAME2();
+
+	print_counts();
+
+	if (trace_selftest_test_probe1_cnt != 2)
+		goto out_free;
+	if (trace_selftest_test_probe2_cnt != 2)
+		goto out_free;
+	if (trace_selftest_test_probe3_cnt != 4)
+		goto out_free;
+
+	ret = 0;
+ out_free:
+	unregister_ftrace_function(dyn_ops);
+	kfree(dyn_ops);
+
+ out:
+	/* Purposely unregister in the same order */
+	unregister_ftrace_function(&test_probe1);
+	unregister_ftrace_function(&test_probe2);
+	unregister_ftrace_function(&test_probe3);
+	unregister_ftrace_function(&test_global);
+
+	/* Make sure everything is off */
+	reset_counts();
+	DYN_FTRACE_TEST_NAME();
+	DYN_FTRACE_TEST_NAME();
+
+	if (trace_selftest_test_probe1_cnt ||
+	    trace_selftest_test_probe2_cnt ||
+	    trace_selftest_test_probe3_cnt ||
+	    trace_selftest_test_global_cnt ||
+	    trace_selftest_test_dyn_cnt)
+		ret = -1;
+
+	ftrace_enabled = save_ftrace_enabled;
+
+	return ret;
+}
+
 /* Test dynamic code modification and ftrace filters */
 int trace_selftest_startup_dynamic_tracing(struct tracer *trace,
 					   struct trace_array *tr,
 					   int (*func)(void))
 {
 	int save_ftrace_enabled = ftrace_enabled;
-	int save_tracer_enabled = tracer_enabled;
 	unsigned long count;
 	char *func_name;
 	int ret;
@@ -118,7 +330,6 @@ int trace_selftest_startup_dynamic_tracing(struct tracer *trace,
 
 	/* enable tracing, and record the filter function */
 	ftrace_enabled = 1;
-	tracer_enabled = 1;
 
 	/* passed in by parameter to fool gcc from optimizing */
 	func();
@@ -131,7 +342,7 @@ int trace_selftest_startup_dynamic_tracing(struct tracer *trace,
 	func_name = "*" __stringify(DYN_FTRACE_TEST_NAME);
 
 	/* filter only on our function */
-	ftrace_set_filter(func_name, strlen(func_name), 1);
+	ftrace_set_global_filter(func_name, strlen(func_name), 1);
 
 	/* enable tracing */
 	ret = tracer_init(trace, tr);
@@ -166,28 +377,272 @@ int trace_selftest_startup_dynamic_tracing(struct tracer *trace,
 
 	/* check the trace buffer */
 	ret = trace_test_buffer(tr, &count);
-	trace->reset(tr);
 	tracing_start();
 
 	/* we should only have one item */
 	if (!ret && count != 1) {
+		trace->reset(tr);
 		printk(KERN_CONT ".. filter failed count=%ld ..", count);
 		ret = -1;
 		goto out;
 	}
 
+	/* Test the ops with global tracing running */
+	ret = trace_selftest_ops(1);
+	trace->reset(tr);
+
  out:
 	ftrace_enabled = save_ftrace_enabled;
-	tracer_enabled = save_tracer_enabled;
 
 	/* Enable tracing on all functions again */
-	ftrace_set_filter(NULL, 0, 1);
+	ftrace_set_global_filter(NULL, 0, 1);
+
+	/* Test the ops with global tracing off */
+	if (!ret)
+		ret = trace_selftest_ops(2);
+
+	return ret;
+}
+
+static int trace_selftest_recursion_cnt;
+static void trace_selftest_test_recursion_func(unsigned long ip,
+					       unsigned long pip,
+					       struct ftrace_ops *op,
+					       struct pt_regs *pt_regs)
+{
+	/*
+	 * This function is registered without the recursion safe flag.
+	 * The ftrace infrastructure should provide the recursion
+	 * protection. If not, this will crash the kernel!
+	 */
+	trace_selftest_recursion_cnt++;
+	DYN_FTRACE_TEST_NAME();
+}
+
+static void trace_selftest_test_recursion_safe_func(unsigned long ip,
+						    unsigned long pip,
+						    struct ftrace_ops *op,
+						    struct pt_regs *pt_regs)
+{
+	/*
+	 * We said we would provide our own recursion. By calling
+	 * this function again, we should recurse back into this function
+	 * and count again. But this only happens if the arch supports
+	 * all of ftrace features and nothing else is using the function
+	 * tracing utility.
+	 */
+	if (trace_selftest_recursion_cnt++)
+		return;
+	DYN_FTRACE_TEST_NAME();
+}
+
+static struct ftrace_ops test_rec_probe = {
+	.func			= trace_selftest_test_recursion_func,
+};
+
+static struct ftrace_ops test_recsafe_probe = {
+	.func			= trace_selftest_test_recursion_safe_func,
+	.flags			= FTRACE_OPS_FL_RECURSION_SAFE,
+};
+
+static int
+trace_selftest_function_recursion(void)
+{
+	int save_ftrace_enabled = ftrace_enabled;
+	char *func_name;
+	int len;
+	int ret;
+	int cnt;
+
+	/* The previous test PASSED */
+	pr_cont("PASSED\n");
+	pr_info("Testing ftrace recursion: ");
+
+
+	/* enable tracing, and record the filter function */
+	ftrace_enabled = 1;
+
+	/* Handle PPC64 '.' name */
+	func_name = "*" __stringify(DYN_FTRACE_TEST_NAME);
+	len = strlen(func_name);
+
+	ret = ftrace_set_filter(&test_rec_probe, func_name, len, 1);
+	if (ret) {
+		pr_cont("*Could not set filter* ");
+		goto out;
+	}
+
+	ret = register_ftrace_function(&test_rec_probe);
+	if (ret) {
+		pr_cont("*could not register callback* ");
+		goto out;
+	}
+
+	DYN_FTRACE_TEST_NAME();
+
+	unregister_ftrace_function(&test_rec_probe);
+
+	ret = -1;
+	if (trace_selftest_recursion_cnt != 1) {
+		pr_cont("*callback not called once (%d)* ",
+			trace_selftest_recursion_cnt);
+		goto out;
+	}
+
+	trace_selftest_recursion_cnt = 1;
+
+	pr_cont("PASSED\n");
+	pr_info("Testing ftrace recursion safe: ");
+
+	ret = ftrace_set_filter(&test_recsafe_probe, func_name, len, 1);
+	if (ret) {
+		pr_cont("*Could not set filter* ");
+		goto out;
+	}
+
+	ret = register_ftrace_function(&test_recsafe_probe);
+	if (ret) {
+		pr_cont("*could not register callback* ");
+		goto out;
+	}
+
+	DYN_FTRACE_TEST_NAME();
+
+	unregister_ftrace_function(&test_recsafe_probe);
+
+	/*
+	 * If arch supports all ftrace features, and no other task
+	 * was on the list, we should be fine.
+	 */
+	if (!ftrace_nr_registered_ops() && !FTRACE_FORCE_LIST_FUNC)
+		cnt = 2; /* Should have recursed */
+	else
+		cnt = 1;
+
+	ret = -1;
+	if (trace_selftest_recursion_cnt != cnt) {
+		pr_cont("*callback not called expected %d times (%d)* ",
+			cnt, trace_selftest_recursion_cnt);
+		goto out;
+	}
+
+	ret = 0;
+out:
+	ftrace_enabled = save_ftrace_enabled;
 
 	return ret;
 }
 #else
 # define trace_selftest_startup_dynamic_tracing(trace, tr, func) ({ 0; })
+# define trace_selftest_function_recursion() ({ 0; })
 #endif /* CONFIG_DYNAMIC_FTRACE */
+
+static enum {
+	TRACE_SELFTEST_REGS_START,
+	TRACE_SELFTEST_REGS_FOUND,
+	TRACE_SELFTEST_REGS_NOT_FOUND,
+} trace_selftest_regs_stat;
+
+static void trace_selftest_test_regs_func(unsigned long ip,
+					  unsigned long pip,
+					  struct ftrace_ops *op,
+					  struct pt_regs *pt_regs)
+{
+	if (pt_regs)
+		trace_selftest_regs_stat = TRACE_SELFTEST_REGS_FOUND;
+	else
+		trace_selftest_regs_stat = TRACE_SELFTEST_REGS_NOT_FOUND;
+}
+
+static struct ftrace_ops test_regs_probe = {
+	.func		= trace_selftest_test_regs_func,
+	.flags		= FTRACE_OPS_FL_RECURSION_SAFE | FTRACE_OPS_FL_SAVE_REGS,
+};
+
+static int
+trace_selftest_function_regs(void)
+{
+	int save_ftrace_enabled = ftrace_enabled;
+	char *func_name;
+	int len;
+	int ret;
+	int supported = 0;
+
+#ifdef ARCH_SUPPORTS_FTRACE_SAVE_REGS
+	supported = 1;
+#endif
+
+	/* The previous test PASSED */
+	pr_cont("PASSED\n");
+	pr_info("Testing ftrace regs%s: ",
+		!supported ? "(no arch support)" : "");
+
+	/* enable tracing, and record the filter function */
+	ftrace_enabled = 1;
+
+	/* Handle PPC64 '.' name */
+	func_name = "*" __stringify(DYN_FTRACE_TEST_NAME);
+	len = strlen(func_name);
+
+	ret = ftrace_set_filter(&test_regs_probe, func_name, len, 1);
+	/*
+	 * If DYNAMIC_FTRACE is not set, then we just trace all functions.
+	 * This test really doesn't care.
+	 */
+	if (ret && ret != -ENODEV) {
+		pr_cont("*Could not set filter* ");
+		goto out;
+	}
+
+	ret = register_ftrace_function(&test_regs_probe);
+	/*
+	 * Now if the arch does not support passing regs, then this should
+	 * have failed.
+	 */
+	if (!supported) {
+		if (!ret) {
+			pr_cont("*registered save-regs without arch support* ");
+			goto out;
+		}
+		test_regs_probe.flags |= FTRACE_OPS_FL_SAVE_REGS_IF_SUPPORTED;
+		ret = register_ftrace_function(&test_regs_probe);
+	}
+	if (ret) {
+		pr_cont("*could not register callback* ");
+		goto out;
+	}
+
+
+	DYN_FTRACE_TEST_NAME();
+
+	unregister_ftrace_function(&test_regs_probe);
+
+	ret = -1;
+
+	switch (trace_selftest_regs_stat) {
+	case TRACE_SELFTEST_REGS_START:
+		pr_cont("*callback never called* ");
+		goto out;
+
+	case TRACE_SELFTEST_REGS_FOUND:
+		if (supported)
+			break;
+		pr_cont("*callback received regs without arch support* ");
+		goto out;
+
+	case TRACE_SELFTEST_REGS_NOT_FOUND:
+		if (!supported)
+			break;
+		pr_cont("*callback received NULL regs* ");
+		goto out;
+	}
+
+	ret = 0;
+out:
+	ftrace_enabled = save_ftrace_enabled;
+
+	return ret;
+}
 
 /*
  * Simple verification test of ftrace function tracer.
@@ -198,7 +653,6 @@ int
 trace_selftest_startup_function(struct tracer *trace, struct trace_array *tr)
 {
 	int save_ftrace_enabled = ftrace_enabled;
-	int save_tracer_enabled = tracer_enabled;
 	unsigned long count;
 	int ret;
 
@@ -207,7 +661,6 @@ trace_selftest_startup_function(struct tracer *trace, struct trace_array *tr)
 
 	/* start the tracing */
 	ftrace_enabled = 1;
-	tracer_enabled = 1;
 
 	ret = tracer_init(trace, tr);
 	if (ret) {
@@ -234,10 +687,16 @@ trace_selftest_startup_function(struct tracer *trace, struct trace_array *tr)
 
 	ret = trace_selftest_startup_dynamic_tracing(trace, tr,
 						     DYN_FTRACE_TEST_NAME);
+	if (ret)
+		goto out;
 
+	ret = trace_selftest_function_recursion();
+	if (ret)
+		goto out;
+
+	ret = trace_selftest_function_regs();
  out:
 	ftrace_enabled = save_ftrace_enabled;
-	tracer_enabled = save_tracer_enabled;
 
 	/* kill ftrace totally if we failed */
 	if (ret)
@@ -570,6 +1029,8 @@ static int trace_wakeup_test_thread(void *data)
 	set_current_state(TASK_INTERRUPTIBLE);
 	schedule();
 
+	complete(x);
+
 	/* we are awake, now wait to disappear */
 	while (!kthread_should_stop()) {
 		/*
@@ -613,29 +1074,27 @@ trace_selftest_startup_wakeup(struct tracer *trace, struct trace_array *tr)
 	/* reset the max latency */
 	tracing_max_latency = 0;
 
-	/* sleep to let the RT thread sleep too */
-	msleep(100);
+	while (p->on_rq) {
+		/*
+		 * Sleep to make sure the RT thread is asleep too.
+		 * On virtual machines we can't rely on timings,
+		 * but we want to make sure this test still works.
+		 */
+		msleep(100);
+	}
 
-	/*
-	 * Yes this is slightly racy. It is possible that for some
-	 * strange reason that the RT thread we created, did not
-	 * call schedule for 100ms after doing the completion,
-	 * and we do a wakeup on a task that already is awake.
-	 * But that is extremely unlikely, and the worst thing that
-	 * happens in such a case, is that we disable tracing.
-	 * Honestly, if this race does happen something is horrible
-	 * wrong with the system.
-	 */
+	init_completion(&isrt);
 
 	wake_up_process(p);
 
-	/* give a little time to let the thread wake up */
-	msleep(100);
+	/* Wait for the task to wake up */
+	wait_for_completion(&isrt);
 
 	/* stop the tracing. */
 	tracing_stop();
 	/* check both trace buffers */
 	ret = trace_test_buffer(tr, NULL);
+	printk("ret = %d\n", ret);
 	if (!ret)
 		ret = trace_test_buffer(&max_tr, &count);
 

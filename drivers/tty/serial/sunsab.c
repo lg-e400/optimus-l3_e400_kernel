@@ -37,14 +37,15 @@
 #include <asm/io.h>
 #include <asm/irq.h>
 #include <asm/prom.h>
+#include <asm/setup.h>
 
 #if defined(CONFIG_SERIAL_SUNSAB_CONSOLE) && defined(CONFIG_MAGIC_SYSRQ)
 #define SUPPORT_SYSRQ
 #endif
 
 #include <linux/serial_core.h>
+#include <linux/sunserialcore.h>
 
-#include "suncore.h"
 #include "sunsab.h"
 
 struct uart_sunsab_port {
@@ -953,7 +954,7 @@ static inline struct console *SUNSAB_CONSOLE(void)
 #define sunsab_console_init()	do { } while (0)
 #endif
 
-static int __devinit sunsab_init_one(struct uart_sunsab_port *up,
+static int sunsab_init_one(struct uart_sunsab_port *up,
 				     struct platform_device *op,
 				     unsigned long offset,
 				     int line)
@@ -1006,7 +1007,7 @@ static int __devinit sunsab_init_one(struct uart_sunsab_port *up,
 	return 0;
 }
 
-static int __devinit sab_probe(struct platform_device *op, const struct of_device_id *match)
+static int sab_probe(struct platform_device *op)
 {
 	static int inst;
 	struct uart_sunsab_port *up;
@@ -1062,7 +1063,7 @@ out:
 	return err;
 }
 
-static int __devexit sab_remove(struct platform_device *op)
+static int sab_remove(struct platform_device *op)
 {
 	struct uart_sunsab_port *up = dev_get_drvdata(&op->dev);
 
@@ -1092,14 +1093,14 @@ static const struct of_device_id sab_match[] = {
 };
 MODULE_DEVICE_TABLE(of, sab_match);
 
-static struct of_platform_driver sab_driver = {
+static struct platform_driver sab_driver = {
 	.driver = {
 		.name = "sab",
 		.owner = THIS_MODULE,
 		.of_match_table = sab_match,
 	},
 	.probe		= sab_probe,
-	.remove		= __devexit_p(sab_remove),
+	.remove		= sab_remove,
 };
 
 static int __init sunsab_init(void)
@@ -1130,12 +1131,12 @@ static int __init sunsab_init(void)
 		}
 	}
 
-	return of_register_platform_driver(&sab_driver);
+	return platform_driver_register(&sab_driver);
 }
 
 static void __exit sunsab_exit(void)
 {
-	of_unregister_platform_driver(&sab_driver);
+	platform_driver_unregister(&sab_driver);
 	if (sunsab_reg.nr) {
 		sunserial_unregister_minors(&sunsab_reg, sunsab_reg.nr);
 	}

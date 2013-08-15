@@ -112,7 +112,7 @@ extern struct nv17_tv_norm_params {
 } nv17_tv_norms[NUM_TV_NORMS];
 #define get_tv_norm(enc) (&nv17_tv_norms[to_tv_enc(enc)->tv_norm])
 
-extern struct drm_display_mode nv17_tv_modes[];
+extern const struct drm_display_mode nv17_tv_modes[];
 
 static inline int interpolate(int y0, int y1, int y2, int x)
 {
@@ -130,12 +130,14 @@ void nv17_ctv_update_rescaler(struct drm_encoder *encoder);
 static inline void nv_write_ptv(struct drm_device *dev, uint32_t reg,
 				uint32_t val)
 {
-	nv_wr32(dev, reg, val);
+	struct nouveau_device *device = nouveau_dev(dev);
+	nv_wr32(device, reg, val);
 }
 
 static inline uint32_t nv_read_ptv(struct drm_device *dev, uint32_t reg)
 {
-	return nv_rd32(dev, reg);
+	struct nouveau_device *device = nouveau_dev(dev);
+	return nv_rd32(device, reg);
 }
 
 static inline void nv_write_tv_enc(struct drm_device *dev, uint8_t reg,

@@ -34,9 +34,9 @@ static void kb3886_bl_set_intensity(int intensity)
 	mutex_lock(&bl_mutex);
 	intensity = intensity&0xff;
 	outb(KB3886_ADC_DAC_PWM, KB3886_PARENT);
-	msleep(10);
+	usleep_range(10000, 11000);
 	outb(KB3886_PWM0_WRITE, KB3886_IO);
-	msleep(10);
+	usleep_range(10000, 11000);
 	outb(intensity, KB3886_IO);
 	mutex_unlock(&bl_mutex);
 }
@@ -149,6 +149,7 @@ static int kb3886bl_probe(struct platform_device *pdev)
 		machinfo->limit_mask = -1;
 
 	memset(&props, 0, sizeof(struct backlight_properties));
+	props.type = BACKLIGHT_RAW;
 	props.max_brightness = machinfo->max_intensity;
 	kb3886_backlight_device = backlight_device_register("kb3886-bl",
 							    &pdev->dev, NULL,

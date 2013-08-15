@@ -8,7 +8,9 @@
  * published by the Free Software Foundation.
  */
 #include <linux/delay.h>
+#include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
+#include <linux/freezer.h>
 #include <linux/init.h>
 #include <linux/kthread.h>
 #include <linux/module.h>
@@ -53,6 +55,11 @@ static unsigned int pq_sources = 3;
 module_param(pq_sources, uint, S_IRUGO);
 MODULE_PARM_DESC(pq_sources,
 		"Number of p+q source buffers (default: 3)");
+
+static int timeout = 3000;
+module_param(timeout, uint, S_IRUGO);
+MODULE_PARM_DESC(timeout, "Transfer Timeout in msec (default: 3000), "
+		 "Pass -1 for infinite timeout");
 
 /*
  * Initialization patterns. All bytes in the source buffer has bit 7
@@ -207,9 +214,32 @@ static unsigned int dmatest_verify(u8 **bufs, unsigned int start,
 	return error_count;
 }
 
-static void dmatest_callback(void *completion)
+/* poor man's completion - we want to use wait_event_freezable() on it */
+struct dmatest_done {
+	bool			done;
+	wait_queue_head_t	*wait;
+};
+
+static void dmatest_callback(void *arg)
 {
-	complete(completion);
+	struct dmatest_done *done = arg;
+
+	done->done = true;
+	wake_up_all(done->wait);
+}
+
+static inline void unmap_src(struct device *dev, dma_addr_t *addr, size_t len,
+			     unsigned int count)
+{
+	while (count--)
+		dma_unmap_single(dev, addr[count], len, DMA_TO_DEVICE);
+}
+
+static inline void unmap_dst(struct device *dev, dma_addr_t *addr, size_t len,
+			     unsigned int count)
+{
+	while (count--)
+		dma_unmap_single(dev, addr[count], len, DMA_BIDIRECTIONAL);
 }
 
 /*
@@ -228,7 +258,9 @@ static void dmatest_callback(void *completion)
  */
 static int dmatest_func(void *data)
 {
+	DECLARE_WAIT_QUEUE_HEAD_ONSTACK(done_wait);
 	struct dmatest_thread	*thread = data;
+	struct dmatest_done	done = { .wait = &done_wait };
 	struct dma_chan		*chan;
 	const char		*thread_name;
 	unsigned int		src_off, dst_off, len;
@@ -245,6 +277,7 @@ static int dmatest_func(void *data)
 	int			i;
 
 	thread_name = current->comm;
+	set_freezable();
 
 	ret = -ENOMEM;
 
@@ -285,7 +318,12 @@ static int dmatest_func(void *data)
 
 	set_user_nice(current, 10);
 
-	flags = DMA_CTRL_ACK | DMA_COMPL_SKIP_DEST_UNMAP | DMA_PREP_INTERRUPT;
+	/*
+	 * src buffers are freed by the DMAEngine code with dma_unmap_single()
+	 * dst buffers are freed by ourselves below
+	 */
+	flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT
+	      | DMA_COMPL_SKIP_DEST_UNMAP | DMA_COMPL_SRC_UNMAP_SINGLE;
 
 	while (!kthread_should_stop()
 	       && !(iterations && total_tests >= iterations)) {
@@ -293,8 +331,6 @@ static int dmatest_func(void *data)
 		struct dma_async_tx_descriptor *tx = NULL;
 		dma_addr_t dma_srcs[src_cnt];
 		dma_addr_t dma_dsts[dst_cnt];
-		struct completion cmp;
-		unsigned long tmo = msecs_to_jiffies(3000);
 		u8 align = 0;
 
 		total_tests++;
@@ -331,14 +367,34 @@ static int dmatest_func(void *data)
 
 			dma_srcs[i] = dma_map_single(dev->dev, buf, len,
 						     DMA_TO_DEVICE);
+			ret = dma_mapping_error(dev->dev, dma_srcs[i]);
+			if (ret) {
+				unmap_src(dev->dev, dma_srcs, len, i);
+				pr_warn("%s: #%u: mapping error %d with "
+					"src_off=0x%x len=0x%x\n",
+					thread_name, total_tests - 1, ret,
+					src_off, len);
+				failed_tests++;
+				continue;
+			}
 		}
 		/* map with DMA_BIDIRECTIONAL to force writeback/invalidate */
 		for (i = 0; i < dst_cnt; i++) {
 			dma_dsts[i] = dma_map_single(dev->dev, thread->dsts[i],
 						     test_buf_size,
 						     DMA_BIDIRECTIONAL);
+			ret = dma_mapping_error(dev->dev, dma_dsts[i]);
+			if (ret) {
+				unmap_src(dev->dev, dma_srcs, len, src_cnt);
+				unmap_dst(dev->dev, dma_dsts, test_buf_size, i);
+				pr_warn("%s: #%u: mapping error %d with "
+					"dst_off=0x%x len=0x%x\n",
+					thread_name, total_tests - 1, ret,
+					dst_off, test_buf_size);
+				failed_tests++;
+				continue;
+			}
 		}
-
 
 		if (thread->type == DMA_MEMCPY)
 			tx = dev->device_prep_dma_memcpy(chan,
@@ -361,13 +417,8 @@ static int dmatest_func(void *data)
 		}
 
 		if (!tx) {
-			for (i = 0; i < src_cnt; i++)
-				dma_unmap_single(dev->dev, dma_srcs[i], len,
-						 DMA_TO_DEVICE);
-			for (i = 0; i < dst_cnt; i++)
-				dma_unmap_single(dev->dev, dma_dsts[i],
-						 test_buf_size,
-						 DMA_BIDIRECTIONAL);
+			unmap_src(dev->dev, dma_srcs, len, src_cnt);
+			unmap_dst(dev->dev, dma_dsts, test_buf_size, dst_cnt);
 			pr_warning("%s: #%u: prep error with src_off=0x%x "
 					"dst_off=0x%x len=0x%x\n",
 					thread_name, total_tests - 1,
@@ -377,9 +428,9 @@ static int dmatest_func(void *data)
 			continue;
 		}
 
-		init_completion(&cmp);
+		done.done = false;
 		tx->callback = dmatest_callback;
-		tx->callback_param = &cmp;
+		tx->callback_param = &done;
 		cookie = tx->tx_submit(tx);
 
 		if (dma_submit_error(cookie)) {
@@ -393,10 +444,20 @@ static int dmatest_func(void *data)
 		}
 		dma_async_issue_pending(chan);
 
-		tmo = wait_for_completion_timeout(&cmp, tmo);
+		wait_event_freezable_timeout(done_wait, done.done,
+					     msecs_to_jiffies(timeout));
+
 		status = dma_async_is_tx_complete(chan, cookie, NULL, NULL);
 
-		if (tmo == 0) {
+		if (!done.done) {
+			/*
+			 * We're leaving the timed out dma operation with
+			 * dangling pointer to done_wait.  To make this
+			 * correct, we'll need to allocate wait_done for
+			 * each test iteration and perform "who's gonna
+			 * free it this time?" dancing.  For now, just
+			 * leave it dangling.
+			 */
 			pr_warning("%s: #%u: test timed out\n",
 				   thread_name, total_tests - 1);
 			failed_tests++;
@@ -411,9 +472,7 @@ static int dmatest_func(void *data)
 		}
 
 		/* Unmap by myself (see DMA_COMPL_SKIP_DEST_UNMAP above) */
-		for (i = 0; i < dst_cnt; i++)
-			dma_unmap_single(dev->dev, dma_dsts[i], test_buf_size,
-					 DMA_BIDIRECTIONAL);
+		unmap_dst(dev->dev, dma_dsts, test_buf_size, dst_cnt);
 
 		error_count = 0;
 
@@ -466,6 +525,8 @@ err_srcs:
 	pr_notice("%s: terminating after %u tests, %u failures (status %d)\n",
 			thread_name, total_tests, failed_tests, ret);
 
+	/* terminate all transfers on specified channels */
+	chan->device->device_control(chan, DMA_TERMINATE_ALL, 0);
 	if (iterations > 0)
 		while (!kthread_should_stop()) {
 			DECLARE_WAIT_QUEUE_HEAD_ONSTACK(wait_dmatest_exit);
@@ -488,6 +549,10 @@ static void dmatest_cleanup_channel(struct dmatest_chan *dtc)
 		list_del(&thread->node);
 		kfree(thread);
 	}
+
+	/* terminate all transfers on specified channels */
+	dtc->chan->device->device_control(dtc->chan, DMA_TERMINATE_ALL, 0);
+
 	kfree(dtc);
 }
 
@@ -561,7 +626,7 @@ static int dmatest_add_channel(struct dma_chan *chan)
 	}
 	if (dma_has_cap(DMA_PQ, dma_dev->cap_mask)) {
 		cnt = dmatest_add_threads(dtc, DMA_PQ);
-		thread_count += cnt > 0 ?: 0;
+		thread_count += cnt > 0 ? cnt : 0;
 	}
 
 	pr_info("dmatest: Started %u threads using %s\n",
@@ -624,5 +689,5 @@ static void __exit dmatest_exit(void)
 }
 module_exit(dmatest_exit);
 
-MODULE_AUTHOR("Haavard Skinnemoen <hskinnemoen@atmel.com>");
+MODULE_AUTHOR("Haavard Skinnemoen (Atmel)");
 MODULE_LICENSE("GPL v2");

@@ -2,6 +2,7 @@
 #define __ASM_ARM_CPUTYPE_H
 
 #include <linux/stringify.h>
+#include <linux/kernel.h>
 
 #define CPUID_ID	0
 #define CPUID_CACHETYPE	1
@@ -24,6 +25,21 @@
 #define CPUID_EXT_ISAR4	"c2, 4"
 #define CPUID_EXT_ISAR5	"c2, 5"
 
+#define MPIDR_SMP_BITMASK (0x3 << 30)
+#define MPIDR_SMP_VALUE (0x2 << 30)
+
+#define MPIDR_MT_BITMASK (0x1 << 24)
+
+#define MPIDR_HWID_BITMASK 0xFFFFFF
+
+#define MPIDR_LEVEL_BITS 8
+#define MPIDR_LEVEL_MASK ((1 << MPIDR_LEVEL_BITS) - 1)
+
+#define MPIDR_AFFINITY_LEVEL(mpidr, level) \
+	((mpidr >> (MPIDR_LEVEL_BITS * level)) & MPIDR_LEVEL_MASK)
+
+extern unsigned int processor_id;
+
 #ifdef CONFIG_CPU_CP15
 #define read_cpuid(reg)							\
 	({								\
@@ -44,7 +60,6 @@
 		__val;							\
 	})
 #else
-extern unsigned int processor_id;
 #define read_cpuid(reg) (processor_id)
 #define read_cpuid_ext(reg) 0
 #endif

@@ -26,7 +26,7 @@
 #define HP680_DEFAULT_INTENSITY 10
 
 static int hp680bl_suspended;
-static int current_intensity = 0;
+static int current_intensity;
 static DEFINE_SPINLOCK(bl_lock);
 
 static void hp680bl_send_intensity(struct backlight_device *bd)
@@ -103,12 +103,13 @@ static const struct backlight_ops hp680bl_ops = {
 	.update_status  = hp680bl_set_intensity,
 };
 
-static int __devinit hp680bl_probe(struct platform_device *pdev)
+static int hp680bl_probe(struct platform_device *pdev)
 {
 	struct backlight_properties props;
 	struct backlight_device *bd;
 
 	memset(&props, 0, sizeof(struct backlight_properties));
+	props.type = BACKLIGHT_RAW;
 	props.max_brightness = HP680_MAX_INTENSITY;
 	bd = backlight_device_register("hp680-bl", &pdev->dev, NULL,
 				       &hp680bl_ops, &props);
@@ -167,7 +168,7 @@ static int __init hp680bl_init(void)
 static void __exit hp680bl_exit(void)
 {
 	platform_device_unregister(hp680bl_device);
- 	platform_driver_unregister(&hp680bl_driver);
+	platform_driver_unregister(&hp680bl_driver);
 }
 
 module_init(hp680bl_init);

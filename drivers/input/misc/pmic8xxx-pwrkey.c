@@ -23,19 +23,17 @@
 #include <linux/mfd/pm8xxx/core.h>
 #include <linux/input/pmic8xxx-pwrkey.h>
 
-#define PON_CNTL_1	0x1C
+#define PON_CNTL_1 0x1C
 #define PON_CNTL_PULL_UP BIT(7)
 #define PON_CNTL_TRIG_DELAY_MASK (0x7)
 
 /**
  * struct pmic8xxx_pwrkey - pmic8xxx pwrkey information
  * @key_press_irq: key press irq number
- * @pdata: platform data
  */
 struct pmic8xxx_pwrkey {
 	struct input_dev *pwr;
 	int key_press_irq;
-	const struct pm8xxx_pwrkey_platform_data *pdata;
 };
 
 static irqreturn_t pwrkey_press_irq(int irq, void *_pwrkey)
@@ -58,7 +56,7 @@ static irqreturn_t pwrkey_release_irq(int irq, void *_pwrkey)
 	return IRQ_HANDLED;
 }
 
-#ifdef CONFIG_PM
+#ifdef CONFIG_PM_SLEEP
 static int pmic8xxx_pwrkey_suspend(struct device *dev)
 {
 	struct pmic8xxx_pwrkey *pwrkey = dev_get_drvdata(dev);
@@ -78,14 +76,12 @@ static int pmic8xxx_pwrkey_resume(struct device *dev)
 
 	return 0;
 }
-
-static const struct dev_pm_ops pm8xxx_pwr_key_pm_ops = {
-	.suspend	= pmic8xxx_pwrkey_suspend,
-	.resume		= pmic8xxx_pwrkey_resume,
-};
 #endif
 
-static int __devinit pmic8xxx_pwrkey_probe(struct platform_device *pdev)
+static SIMPLE_DEV_PM_OPS(pm8xxx_pwr_key_pm_ops,
+		pmic8xxx_pwrkey_suspend, pmic8xxx_pwrkey_resume);
+
+static int pmic8xxx_pwrkey_probe(struct platform_device *pdev)
 {
 	struct input_dev *pwr;
 	int key_release_irq = platform_get_irq(pdev, 0);
@@ -95,7 +91,7 @@ static int __devinit pmic8xxx_pwrkey_probe(struct platform_device *pdev)
 	u8 pon_cntl;
 	struct pmic8xxx_pwrkey *pwrkey;
 	const struct pm8xxx_pwrkey_platform_data *pdata =
-						pdev->dev.platform_data;
+					dev_get_platdata(&pdev->dev);
 
 	if (!pdata) {
 		dev_err(&pdev->dev, "power key platform data not supplied\n");
@@ -110,8 +106,6 @@ static int __devinit pmic8xxx_pwrkey_probe(struct platform_device *pdev)
 	pwrkey = kzalloc(sizeof(*pwrkey), GFP_KERNEL);
 	if (!pwrkey)
 		return -ENOMEM;
-
-	pwrkey->pdata = pdata;
 
 	pwr = input_allocate_device();
 	if (!pwr) {
@@ -159,7 +153,7 @@ static int __devinit pmic8xxx_pwrkey_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, pwrkey);
 
-	err = request_threaded_irq(key_press_irq, NULL, pwrkey_press_irq,
+	err = request_irq(key_press_irq, pwrkey_press_irq,
 		IRQF_TRIGGER_RISING, "pmic8xxx_pwrkey_press", pwrkey);
 	if (err < 0) {
 		dev_dbg(&pdev->dev, "Can't get %d IRQ for pwrkey: %d\n",
@@ -167,7 +161,7 @@ static int __devinit pmic8xxx_pwrkey_probe(struct platform_device *pdev)
 		goto unreg_input_dev;
 	}
 
-	err = request_threaded_irq(key_release_irq, NULL, pwrkey_release_irq,
+	err = request_irq(key_release_irq, pwrkey_release_irq,
 		 IRQF_TRIGGER_RISING, "pmic8xxx_pwrkey_release", pwrkey);
 	if (err < 0) {
 		dev_dbg(&pdev->dev, "Can't get %d IRQ for pwrkey: %d\n",
@@ -193,7 +187,7 @@ free_pwrkey:
 	return err;
 }
 
-static int __devexit pmic8xxx_pwrkey_remove(struct platform_device *pdev)
+static int pmic8xxx_pwrkey_remove(struct platform_device *pdev)
 {
 	struct pmic8xxx_pwrkey *pwrkey = platform_get_drvdata(pdev);
 	int key_release_irq = platform_get_irq(pdev, 0);
@@ -212,27 +206,14 @@ static int __devexit pmic8xxx_pwrkey_remove(struct platform_device *pdev)
 
 static struct platform_driver pmic8xxx_pwrkey_driver = {
 	.probe		= pmic8xxx_pwrkey_probe,
-	.remove		= __devexit_p(pmic8xxx_pwrkey_remove),
+	.remove		= pmic8xxx_pwrkey_remove,
 	.driver		= {
 		.name	= PM8XXX_PWRKEY_DEV_NAME,
 		.owner	= THIS_MODULE,
-#ifdef CONFIG_PM
 		.pm	= &pm8xxx_pwr_key_pm_ops,
-#endif
 	},
 };
-
-static int __init pmic8xxx_pwrkey_init(void)
-{
-	return platform_driver_register(&pmic8xxx_pwrkey_driver);
-}
-module_init(pmic8xxx_pwrkey_init);
-
-static void __exit pmic8xxx_pwrkey_exit(void)
-{
-	platform_driver_unregister(&pmic8xxx_pwrkey_driver);
-}
-module_exit(pmic8xxx_pwrkey_exit);
+module_platform_driver(pmic8xxx_pwrkey_driver);
 
 MODULE_ALIAS("platform:pmic8xxx_pwrkey");
 MODULE_DESCRIPTION("PMIC8XXX Power Key driver");

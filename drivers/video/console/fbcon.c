@@ -77,7 +77,6 @@
 #include <linux/crc32.h> /* For counting font checksums */
 #include <asm/fb.h>
 #include <asm/irq.h>
-#include <asm/system.h>
 
 #include "fbcon.h"
 
@@ -278,32 +277,13 @@ static int fbcon_get_rotate(struct fb_info *info)
 	return (ops) ? ops->rotate : 0;
 }
 
-/* LGE_CHANGE_S
- * Change codes to remove console cursor on booting screen. Refered to VS740
- * 2010-07-31. minjong.gong@lge.com
- */
-#ifdef CONFIG_LGE_FBCON_INACTIVE_CONSOLE
-extern int msm_fb_get_console_inactive(void);
-#endif
-/* LGE_CHANGE_E, 2010-07-31. minjong.gong@lge.com  */
 static inline int fbcon_is_inactive(struct vc_data *vc, struct fb_info *info)
 {
 	struct fbcon_ops *ops = info->fbcon_par;
 
-/* LGE_CHANGE_S
- * Change codes to remove console cursor on booting screen. Refered to VS740
- * 2010-07-31. minjong.gong@lge.com
- */
-#ifdef CONFIG_LGE_FBCON_INACTIVE_CONSOLE
-	return (info->state != FBINFO_STATE_RUNNING ||
-		vc->vc_mode != KD_TEXT || ops->graphics || msm_fb_get_console_inactive()) &&
-		!vt_force_oops_output(vc);
-#else
 	return (info->state != FBINFO_STATE_RUNNING ||
 		vc->vc_mode != KD_TEXT || ops->graphics) &&
 		!vt_force_oops_output(vc);
-#endif
-/* LGE_CHANGE_E, 2010-07-31. minjong.gong@lge.com  */
 }
 
 static int get_color(struct vc_data *vc, struct fb_info *info,
@@ -389,12 +369,18 @@ static void fb_flashcursor(struct work_struct *work)
 {
 	struct fb_info *info = container_of(work, struct fb_info, queue);
 	struct fbcon_ops *ops = info->fbcon_par;
-	struct display *p;
 	struct vc_data *vc = NULL;
 	int c;
 	int mode;
+	int ret;
 
-	console_lock();
+	/* FIXME: we should sort out the unbind locking instead */
+	/* instead we just fail to flash the cursor if we can't get
+	 * the lock instead of blocking fbcon deinit */
+	ret = console_trylock();
+	if (ret == 0)
+		return;
+
 	if (ops && ops->currcon != -1)
 		vc = vc_cons[ops->currcon].d;
 
@@ -405,7 +391,6 @@ static void fb_flashcursor(struct work_struct *work)
 		return;
 	}
 
-	p = &fb_display[vc->vc_num];
 	c = scr_readw((u16 *) vc->vc_pos);
 	mode = (!ops->cursor_flash || ops->cursor_state.enable) ?
 		CM_ERASE : CM_DRAW;
@@ -464,7 +449,7 @@ static int __init fb_console_setup(char *this_opt)
 
 	while ((options = strsep(&this_opt, ",")) != NULL) {
 		if (!strncmp(options, "font:", 5))
-			strcpy(fontname, options + 5);
+			strlcpy(fontname, options + 5, sizeof(fontname));
 		
 		if (!strncmp(options, "scrollback:", 11)) {
 			options += 11;
@@ -842,10 +827,10 @@ static int set_con2fb_map(int unit, int newidx, int user)
 	if (oldidx == newidx)
 		return 0;
 
-	if (!info || fbcon_has_exited)
+	if (!info)
 		return -EINVAL;
 
- 	if (!err && !search_for_mapped_con()) {
+	if (!search_for_mapped_con() || !con_is_bound(&fb_con)) {
 		info_idx = newidx;
 		return fbcon_takeover(0);
 	}

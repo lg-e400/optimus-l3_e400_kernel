@@ -13,6 +13,7 @@
 #include <linux/fs.h>
 #include <linux/mutex.h>
 #include <linux/buffer_head.h>
+#include <linux/blkdev.h>
 #include "hfsplus_raw.h"
 
 #define DBG_BNODE_REFS	0x00000001
@@ -110,7 +111,9 @@ struct hfsplus_vh;
 struct hfs_btree;
 
 struct hfsplus_sb_info {
+	void *s_vhdr_buf;
 	struct hfsplus_vh *s_vhdr;
+	void *s_backup_vhdr_buf;
 	struct hfsplus_vh *s_backup_vhdr;
 	struct hfs_btree *ext_tree;
 	struct hfs_btree *cat_tree;
@@ -146,12 +149,15 @@ struct hfsplus_sb_info {
 	u32 type;
 
 	umode_t umask;
-	uid_t uid;
-	gid_t gid;
+	kuid_t uid;
+	kgid_t gid;
 
 	int part, session;
-
 	unsigned long flags;
+
+	int work_queued;               /* non-zero delayed work is queued */
+	struct delayed_work sync_work; /* FS sync delayed work */
+	spinlock_t work_lock;          /* protects sync_work and work_queued */
 };
 
 #define HFSPLUS_SB_WRITEBACKUP	0
@@ -258,6 +264,15 @@ struct hfsplus_readdir_data {
 	struct hfsplus_cat_key key;
 };
 
+/*
+ * Find minimum acceptible I/O size for an hfsplus sb.
+ */
+static inline unsigned short hfsplus_min_io_size(struct super_block *sb)
+{
+	return max_t(unsigned short, bdev_logical_block_size(sb->s_bdev),
+		     HFSPLUS_SECTOR_SIZE);
+}
+
 #define hfs_btree_open hfsplus_btree_open
 #define hfs_btree_close hfsplus_btree_close
 #define hfs_btree_write hfsplus_btree_write
@@ -305,6 +320,11 @@ struct hfsplus_readdir_data {
 
 
 /*
+ * hfs+-specific ioctl for making the filesystem bootable
+ */
+#define HFSPLUS_IOC_BLESS _IO('h', 0x80)
+
+/*
  * Functions in any *.c used in other files
  */
 
@@ -315,7 +335,7 @@ int hfsplus_block_free(struct super_block *, u32, u32);
 /* btree.c */
 struct hfs_btree *hfs_btree_open(struct super_block *, u32);
 void hfs_btree_close(struct hfs_btree *);
-void hfs_btree_write(struct hfs_btree *);
+int hfs_btree_write(struct hfs_btree *);
 struct hfs_bnode *hfs_bmap_alloc(struct hfs_btree *);
 void hfs_bmap_free(struct hfs_bnode *);
 
@@ -374,7 +394,7 @@ extern const struct file_operations hfsplus_dir_operations;
 
 /* extents.c */
 int hfsplus_ext_cmp_key(const hfsplus_btree_key *, const hfsplus_btree_key *);
-void hfsplus_ext_write_extent(struct inode *);
+int hfsplus_ext_write_extent(struct inode *);
 int hfsplus_get_block(struct inode *, sector_t, struct buffer_head *, int);
 int hfsplus_free_fork(struct super_block *, u32,
 		struct hfsplus_fork_raw *, int);
@@ -390,9 +410,10 @@ void hfsplus_inode_read_fork(struct inode *, struct hfsplus_fork_raw *);
 void hfsplus_inode_write_fork(struct inode *, struct hfsplus_fork_raw *);
 int hfsplus_cat_read_inode(struct inode *, struct hfs_find_data *);
 int hfsplus_cat_write_inode(struct inode *);
-struct inode *hfsplus_new_inode(struct super_block *, int);
+struct inode *hfsplus_new_inode(struct super_block *, umode_t);
 void hfsplus_delete_inode(struct inode *);
-int hfsplus_file_fsync(struct file *file, int datasync);
+int hfsplus_file_fsync(struct file *file, loff_t start, loff_t end,
+		       int datasync);
 
 /* ioctl.c */
 long hfsplus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
@@ -406,11 +427,11 @@ ssize_t hfsplus_listxattr(struct dentry *dentry, char *buffer, size_t size);
 int hfsplus_parse_options(char *, struct hfsplus_sb_info *);
 int hfsplus_parse_options_remount(char *input, int *force);
 void hfsplus_fill_defaults(struct hfsplus_sb_info *);
-int hfsplus_show_options(struct seq_file *, struct vfsmount *);
+int hfsplus_show_options(struct seq_file *, struct dentry *);
 
 /* super.c */
 struct inode *hfsplus_iget(struct super_block *, unsigned long);
-int hfsplus_sync_fs(struct super_block *sb, int wait);
+void hfsplus_mark_mdb_dirty(struct super_block *sb);
 
 /* tables.c */
 extern u16 hfsplus_case_fold_table[];
@@ -436,8 +457,8 @@ int hfsplus_compare_dentry(const struct dentry *parent,
 /* wrapper.c */
 int hfsplus_read_wrapper(struct super_block *);
 int hfs_part_find(struct super_block *, sector_t *, sector_t *);
-int hfsplus_submit_bio(struct block_device *bdev, sector_t sector,
-		void *data, int rw);
+int hfsplus_submit_bio(struct super_block *sb, sector_t sector,
+		void *buf, void **data, int rw);
 
 /* time macros */
 #define __hfsp_mt2ut(t)		(be32_to_cpu(t) - 2082844800U)

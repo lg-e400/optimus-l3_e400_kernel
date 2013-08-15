@@ -159,8 +159,8 @@ static int pm8xxx_irq_master_handler(struct pm_irq_chip *chip, int master)
 
 static void pm8xxx_irq_handler(unsigned int irq, struct irq_desc *desc)
 {
-	struct pm_irq_chip *chip = get_irq_desc_data(desc);
-	struct irq_chip *irq_chip = get_irq_desc_chip(desc);
+	struct pm_irq_chip *chip = irq_desc_get_handler_data(desc);
+	struct irq_chip *irq_chip = irq_desc_get_chip(desc);
 	u8	root;
 	int	i, ret, masters = 0;
 
@@ -247,20 +247,13 @@ static int pm8xxx_irq_set_wake(struct irq_data *d, unsigned int on)
 	return 0;
 }
 
-static int pm8xxx_irq_read_line(struct irq_data *d)
-{
-	struct pm_irq_chip *chip = irq_data_get_irq_chip_data(d);
-
-	return pm8xxx_get_irq_stat(chip, d->irq);
-}
-
 static struct irq_chip pm8xxx_irq_chip = {
 	.name		= "pm8xxx",
 	.irq_mask_ack	= pm8xxx_irq_mask_ack,
 	.irq_unmask	= pm8xxx_irq_unmask,
 	.irq_set_type	= pm8xxx_irq_set_type,
 	.irq_set_wake	= pm8xxx_irq_set_wake,
-	.irq_read_line	= pm8xxx_irq_read_line,
+	.flags		= IRQCHIP_MASK_ON_SUSPEND,
 };
 
 /**
@@ -316,7 +309,7 @@ bail_out:
 }
 EXPORT_SYMBOL_GPL(pm8xxx_get_irq_stat);
 
-struct pm_irq_chip *  __devinit pm8xxx_irq_init(struct device *dev,
+struct pm_irq_chip *  pm8xxx_irq_init(struct device *dev,
 				const struct pm8xxx_irq_platform_data *pdata)
 {
 	struct pm_irq_chip  *chip;
@@ -351,9 +344,10 @@ struct pm_irq_chip *  __devinit pm8xxx_irq_init(struct device *dev,
 	spin_lock_init(&chip->pm_irq_lock);
 
 	for (pmirq = 0; pmirq < chip->num_irqs; pmirq++) {
-		set_irq_chip(chip->irq_base + pmirq, &pm8xxx_irq_chip);
-		set_irq_chip_data(chip->irq_base + pmirq, chip);
-		set_irq_handler(chip->irq_base + pmirq, handle_level_irq);
+		irq_set_chip_and_handler(chip->irq_base + pmirq,
+				&pm8xxx_irq_chip,
+				handle_level_irq);
+		irq_set_chip_data(chip->irq_base + pmirq, chip);
 #ifdef CONFIG_ARM
 		set_irq_flags(chip->irq_base + pmirq, IRQF_VALID);
 #else
@@ -361,17 +355,17 @@ struct pm_irq_chip *  __devinit pm8xxx_irq_init(struct device *dev,
 #endif
 	}
 
-	set_irq_type(devirq, pdata->irq_trigger_flag);
-	set_irq_data(devirq, chip);
-	set_irq_chained_handler(devirq, pm8xxx_irq_handler);
+	irq_set_irq_type(devirq, pdata->irq_trigger_flag);
+	irq_set_handler_data(devirq, chip);
+	irq_set_chained_handler(devirq, pm8xxx_irq_handler);
 	set_irq_wake(devirq, 1);
 
 	return chip;
 }
 
-int __devexit pm8xxx_irq_exit(struct pm_irq_chip *chip)
+int pm8xxx_irq_exit(struct pm_irq_chip *chip)
 {
-	set_irq_chained_handler(chip->devirq, NULL);
+	irq_set_chained_handler(chip->devirq, NULL);
 	kfree(chip);
 	return 0;
 }

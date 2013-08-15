@@ -25,12 +25,12 @@
 #define IEEE80211_H
 #include <linux/if_ether.h> /* ETH_ALEN */
 #include <linux/kernel.h>   /* ARRAY_SIZE */
-#include <linux/version.h>
 #include <linux/module.h>
 #include <linux/jiffies.h>
 #include <linux/timer.h>
 #include <linux/sched.h>
 #include <linux/semaphore.h>
+#include <linux/interrupt.h>
 
 #include <linux/delay.h>
 #include <linux/wireless.h>
@@ -235,7 +235,10 @@ enum	_ReasonCode{
 
 
 
-#define aSifsTime	 ((priv->ieee80211->current_network.mode == IEEE_A)||(priv->ieee80211->current_network.mode == IEEE_N_24G)||(priv->ieee80211->current_network.mode == IEEE_N_5G))? 16 : 10
+#define aSifsTime ((priv->ieee80211->current_network.mode == IEEE_A || \
+		    priv->ieee80211->current_network.mode == IEEE_N_24G || \
+		    priv->ieee80211->current_network.mode == IEEE_N_5G) ? \
+		   16 : 10)
 
 #define MGMT_QUEUE_NUM 5
 
@@ -1965,7 +1968,7 @@ struct ieee80211_device {
 	u16 prev_seq_ctl;       /* used to drop duplicate frames */
 
 	/* map of allowed channels. 0 is dummy */
-	// FIXME: remeber to default to a basic channel plan depending of the PHY type
+	// FIXME: remember to default to a basic channel plan depending of the PHY type
 	void* pDot11dInfo;
 	bool bGlobalDomain;
 	int rate;       /* current rate */
@@ -2114,12 +2117,12 @@ struct ieee80211_device {
                                   struct ieee80211_network * network, u16 type);
         int (*is_qos_active) (struct net_device *dev, struct sk_buff *skb);
 
-	/* Softmac-generated frames (mamagement) are TXed via this
+	/* Softmac-generated frames (management) are TXed via this
 	 * callback if the flag IEEE_SOFTMAC_SINGLE_QUEUE is
 	 * not set. As some cards may have different HW queues that
 	 * one might want to use for data and management frames
 	 * the option to have two callbacks might be useful.
-	 * This fucntion can't sleep.
+	 * This function can't sleep.
 	 */
 	int (*softmac_hard_start_xmit)(struct sk_buff *skb,
 			       struct net_device *dev);
@@ -2158,9 +2161,9 @@ struct ieee80211_device {
 	 * it is called in a work_queue when swithcing to ad-hoc mode
 	 * or in behalf of iwlist scan when the card is associated
 	 * and root user ask for a scan.
-	 * the fucntion stop_scan should stop both the syncro and
+	 * the function stop_scan should stop both the syncro and
 	 * background scanning and can sleep.
-	 * The fucntion start_scan should initiate the background
+	 * The function start_scan should initiate the background
 	 * scanning and can't sleep.
 	 */
 	void (*scan_syncro)(struct net_device *dev);
@@ -2192,7 +2195,7 @@ struct ieee80211_device {
 	int (*handle_assoc_response) (struct net_device * dev, struct ieee80211_assoc_response_frame * resp, struct ieee80211_network * network);
 
 
-	/* check whether Tx hw resouce available */
+	/* check whether Tx hw resource available */
 	short (*check_nic_enough_desc)(struct net_device *dev, int queue_index);
 	//added by wb for HT related
 //	void (*SwChnlByTimerHandler)(struct net_device *dev, int channel);
@@ -2416,8 +2419,8 @@ extern int ieee80211_wx_set_mlme(struct ieee80211_device *ieee,
 extern int ieee80211_wx_set_gen_ie(struct ieee80211_device *ieee, u8 *ie, size_t len);
 
 /* ieee80211_softmac.c */
-extern short ieee80211_is_54g(struct ieee80211_network net);
-extern short ieee80211_is_shortslot(struct ieee80211_network net);
+extern short ieee80211_is_54g(const struct ieee80211_network *net);
+extern short ieee80211_is_shortslot(const struct ieee80211_network *net);
 extern int ieee80211_rx_frame_softmac(struct ieee80211_device *ieee, struct sk_buff *skb,
 			struct ieee80211_rx_stats *rx_stats, u16 type,
 			u16 stype);

@@ -104,7 +104,8 @@ lpfc_ct_unsol_event(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 	if (unlikely(icmd->ulpStatus == IOSTAT_NEED_BUFFER)) {
 		lpfc_sli_hbqbuf_add_hbqs(phba, LPFC_ELS_HBQ);
 	} else if ((icmd->ulpStatus == IOSTAT_LOCAL_REJECT) &&
-		((icmd->un.ulpWord[4] & 0xff) == IOERR_RCV_BUFFER_WAITING)) {
+		   ((icmd->un.ulpWord[4] & IOERR_PARAM_MASK) ==
+		   IOERR_RCV_BUFFER_WAITING)) {
 		/* Not enough posted buffers; Try posting more buffers */
 		phba->fc_stat.NoRcvBuf++;
 		if (!(phba->sli3_options & LPFC_SLI3_HBQ_ENABLED))
@@ -352,6 +353,8 @@ lpfc_gen_req(struct lpfc_vport *vport, struct lpfc_dmabuf *bmp,
 	icmd->ulpLe = 1;
 	icmd->ulpClass = CLASS3;
 	icmd->ulpContext = ndlp->nlp_rpi;
+	if (phba->sli_rev == LPFC_SLI_REV4)
+		icmd->ulpContext = phba->sli4_hba.rpi_ids[ndlp->nlp_rpi];
 
 	if (phba->sli3_options & LPFC_SLI3_NPIV_ENABLED) {
 		/* For GEN_REQUEST64_CR, use the RPI */
@@ -631,7 +634,8 @@ lpfc_cmpl_ct_cmd_gid_ft(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		/* Check for retry */
 		if (vport->fc_ns_retry < LPFC_MAX_NS_RETRY) {
 			if (irsp->ulpStatus != IOSTAT_LOCAL_REJECT ||
-			    irsp->un.ulpWord[4] != IOERR_NO_RESOURCES)
+			    (irsp->un.ulpWord[4] & IOERR_PARAM_MASK) !=
+			    IOERR_NO_RESOURCES)
 				vport->fc_ns_retry++;
 
 			/* CT command is being retried */
@@ -781,7 +785,9 @@ lpfc_cmpl_ct_cmd_gff_id(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		if (cmdiocb->retry < LPFC_MAX_NS_RETRY) {
 			retry = 1;
 			if (irsp->ulpStatus == IOSTAT_LOCAL_REJECT) {
-				switch (irsp->un.ulpWord[4]) {
+				switch ((irsp->un.ulpWord[4] &
+					IOERR_PARAM_MASK)) {
+
 				case IOERR_NO_RESOURCES:
 					/* We don't increment the retry
 					 * count for this case.
@@ -906,8 +912,10 @@ lpfc_cmpl_ct(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 				 cmdcode, irsp->ulpStatus, irsp->un.ulpWord[4]);
 
 		if ((irsp->ulpStatus == IOSTAT_LOCAL_REJECT) &&
-			((irsp->un.ulpWord[4] == IOERR_SLI_DOWN) ||
-			 (irsp->un.ulpWord[4] == IOERR_SLI_ABORTED)))
+			(((irsp->un.ulpWord[4] & IOERR_PARAM_MASK) ==
+			  IOERR_SLI_DOWN) ||
+			 ((irsp->un.ulpWord[4] & IOERR_PARAM_MASK) ==
+			  IOERR_SLI_ABORTED)))
 			goto out;
 
 		retry = cmdiocb->retry;
@@ -1074,7 +1082,7 @@ int
 lpfc_vport_symbolic_node_name(struct lpfc_vport *vport, char *symbol,
 	size_t size)
 {
-	char fwrev[16];
+	char fwrev[FW_REV_STR_SIZE];
 	int n;
 
 	lpfc_decode_firmware_rev(vport->phba, fwrev, 0);
@@ -1738,6 +1746,55 @@ fdmi_cmd_exit:
 	return 1;
 }
 
+/**
+ * lpfc_delayed_disc_tmo - Timeout handler for delayed discovery timer.
+ * @ptr - Context object of the timer.
+ *
+ * This function set the WORKER_DELAYED_DISC_TMO flag and wake up
+ * the worker thread.
+ **/
+void
+lpfc_delayed_disc_tmo(unsigned long ptr)
+{
+	struct lpfc_vport *vport = (struct lpfc_vport *)ptr;
+	struct lpfc_hba   *phba = vport->phba;
+	uint32_t tmo_posted;
+	unsigned long iflag;
+
+	spin_lock_irqsave(&vport->work_port_lock, iflag);
+	tmo_posted = vport->work_port_events & WORKER_DELAYED_DISC_TMO;
+	if (!tmo_posted)
+		vport->work_port_events |= WORKER_DELAYED_DISC_TMO;
+	spin_unlock_irqrestore(&vport->work_port_lock, iflag);
+
+	if (!tmo_posted)
+		lpfc_worker_wake_up(phba);
+	return;
+}
+
+/**
+ * lpfc_delayed_disc_timeout_handler - Function called by worker thread to
+ *      handle delayed discovery.
+ * @vport: pointer to a host virtual N_Port data structure.
+ *
+ * This function start nport discovery of the vport.
+ **/
+void
+lpfc_delayed_disc_timeout_handler(struct lpfc_vport *vport)
+{
+	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
+
+	spin_lock_irq(shost->host_lock);
+	if (!(vport->fc_flag & FC_DISC_DELAYED)) {
+		spin_unlock_irq(shost->host_lock);
+		return;
+	}
+	vport->fc_flag &= ~FC_DISC_DELAYED;
+	spin_unlock_irq(shost->host_lock);
+
+	lpfc_do_scr_ns_plogi(vport->phba, vport);
+}
+
 void
 lpfc_fdmi_tmo(unsigned long ptr)
 {
@@ -1783,7 +1840,7 @@ lpfc_decode_firmware_rev(struct lpfc_hba *phba, char *fwrevision, int flag)
 	uint8_t *fwname;
 
 	if (phba->sli_rev == LPFC_SLI_REV4)
-		sprintf(fwrevision, "%s", vp->rev.opFwName);
+		snprintf(fwrevision, FW_REV_STR_SIZE, "%s", vp->rev.opFwName);
 	else if (vp->rev.rBit) {
 		if (psli->sli_flag & LPFC_SLI_ACTIVE)
 			rev = vp->rev.sli2FwRev;
@@ -1804,6 +1861,9 @@ lpfc_decode_firmware_rev(struct lpfc_hba *phba, char *fwrevision, int flag)
 			break;
 		case 2:
 			c = 'B';
+			break;
+		case 3:
+			c = 'X';
 			break;
 		default:
 			c = 0;

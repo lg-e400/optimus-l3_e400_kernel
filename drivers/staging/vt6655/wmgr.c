@@ -26,8 +26,8 @@
  * Date: May 8, 2002
  *
  * Functions:
- *      nsMgrObjectInitial - Initialize Management Objet data structure
- *      vMgrObjectReset - Reset Management Objet data structure
+ *      nsMgrObjectInitial - Initialize Management Object data structure
+ *      vMgrObjectReset - Reset Management Object data structure
  *      vMgrAssocBeginSta - Start associate function
  *      vMgrReAssocBeginSta - Start reassociate function
  *      vMgrDisassocBeginSta - Start disassociate function
@@ -54,7 +54,7 @@
  *      bMgrPrepareBeaconToSend - Prepare Beacon frame
  *      s_vMgrLogStatus - Log 802.11 Status
  *      vMgrRxManagePacket - Rcv management frame dispatch function
- *      s_vMgrFormatTIM- Assember TIM field of beacon
+ *      s_vMgrFormatTIM- Assembler TIM field of beacon
  *      vMgrTimerInit- Initial 1-sec and command call back funtions
  *
  * Revision History:
@@ -425,7 +425,7 @@ vMgrTimerInit(
 /*+
  *
  * Routine Description:
- *    Reset the management object  structure.
+ *    Reset the management object structure.
  *
  * Return Value:
  *    None.
@@ -661,7 +661,7 @@ vMgrDisassocBeginSta(
     if (*pStatus == CMD_STATUS_PENDING) {
         pMgmt->eCurrState = WMAC_STATE_IDLE;
         *pStatus = CMD_STATUS_SUCCESS;
-    };
+    }
 
     return;
 }
@@ -1019,7 +1019,7 @@ s_vMgrRxAssocResponse(
             (sFrame.pSuppRates == 0)){
             DBG_PORT80(0xCC);
             return;
-        };
+        }
 
         pMgmt->sAssocInfo.AssocInfo.ResponseFixedIEs.Capabilities = *(sFrame.pwCapInfo);
         pMgmt->sAssocInfo.AssocInfo.ResponseFixedIEs.StatusCode = *(sFrame.pwStatus);
@@ -1039,7 +1039,7 @@ s_vMgrRxAssocResponse(
             if ( (pMgmt->wCurrAID >> 14) != (BIT0 | BIT1) )
             {
                 DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO "AID from AP, has two msb clear.\n");
-            };
+            }
             DBG_PRT(MSG_LEVEL_INFO, KERN_INFO "Association Successful, AID=%d.\n", pMgmt->wCurrAID & ~(BIT14|BIT15));
             pMgmt->eCurrState = WMAC_STATE_ASSOC;
             BSSvUpdateAPNode((void *)pDevice, sFrame.pwCapInfo, sFrame.pSuppRates, sFrame.pExtSuppRates);
@@ -1287,14 +1287,14 @@ s_vMgrRxAuthentication(
     vMgrDecodeAuthen(&sFrame);
     switch (cpu_to_le16((*(sFrame.pwAuthSequence )))){
         case 1:
-            //AP funciton
+            //AP function
             s_vMgrRxAuthenSequence_1(pDevice,pMgmt, &sFrame);
             break;
         case 2:
             s_vMgrRxAuthenSequence_2(pDevice, pMgmt, &sFrame);
             break;
         case 3:
-            //AP funciton
+            //AP function
             s_vMgrRxAuthenSequence_3(pDevice, pMgmt, &sFrame);
             break;
         case 4:
@@ -1692,7 +1692,7 @@ s_vMgrRxDisassociation(
         //try to send associate packet again because of inactivity timeout
       //  if (pMgmt->eCurrState == WMAC_STATE_ASSOC) {
        //     vMgrReAssocBeginSta((PSDevice)pDevice, pMgmt, &CmdStatus);
-      //  };
+      //  }
         if ((pDevice->bWPADEVUp) && (pDevice->skb != NULL)) {
              wpahdr = (viawget_wpa_header *)pDevice->skb->data;
              wpahdr->type = VIAWGET_DISASSOC_MSG;
@@ -1707,7 +1707,7 @@ s_vMgrRxDisassociation(
              memset(pDevice->skb->cb, 0, sizeof(pDevice->skb->cb));
              netif_rx(pDevice->skb);
              pDevice->skb = dev_alloc_skb((int)pDevice->rx_buf_sz);
-         };
+         }
 
  #ifdef WPA_SUPPLICANT_DRIVER_WEXT_SUPPORT
   // if(pDevice->bWPASuppWextEnabled == true)
@@ -1778,7 +1778,7 @@ s_vMgrRxDeauthentication(
                     netif_stop_queue(pDevice->dev);
                     pDevice->bLinkPass = false;
                 }
-            };
+            }
 
             if ((pDevice->bWPADEVUp) && (pDevice->skb != NULL)) {
                  wpahdr = (viawget_wpa_header *)pDevice->skb->data;
@@ -1793,7 +1793,7 @@ s_vMgrRxDeauthentication(
                  memset(pDevice->skb->cb, 0, sizeof(pDevice->skb->cb));
                  netif_rx(pDevice->skb);
                  pDevice->skb = dev_alloc_skb((int)pDevice->rx_buf_sz);
-           };
+           }
 
    #ifdef WPA_SUPPLICANT_DRIVER_WEXT_SUPPORT
   // if(pDevice->bWPASuppWextEnabled == true)
@@ -1912,7 +1912,7 @@ s_vMgrRxBeacon(
         (sFrame.pSuppRates == 0) ) {
         DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO "Rx beacon frame error\n");
         return;
-    };
+    }
 
 
     if (sFrame.pDSParms != NULL) {
@@ -1923,7 +1923,7 @@ s_vMgrRxBeacon(
             byIEChannel = sFrame.pDSParms->byCurrChannel;
         }
         if (byCurrChannel != byIEChannel) {
-            // adjust channel info. bcs we rcv adjcent channel pakckets
+            // adjust channel info. bcs we rcv adjacent channel packets
             bChannelHit = false;
             byCurrChannel = byIEChannel;
         }
@@ -2054,7 +2054,7 @@ if(ChannelExceedZoneType(pDevice,byCurrChannel)==true)
                    sFrame.pSSID->len
                    ) == 0) {
             bIsSSIDEqual = true;
-        };
+        }
     }
 
     if ((WLAN_GET_CAP_INFO_ESS(*sFrame.pwCapInfo)== true) &&
@@ -2081,7 +2081,7 @@ if(ChannelExceedZoneType(pDevice,byCurrChannel)==true)
                 }
             }
             //
-            // Basic Rate Set may change dynamiclly
+            // Basic Rate Set may change dynamically
             //
             if (pBSSList->eNetworkTypeInUse == PHY_TYPE_11B) {
                 uRateLen = WLAN_RATES_MAXLEN_11B;
@@ -2134,12 +2134,12 @@ if(ChannelExceedZoneType(pDevice,byCurrChannel)==true)
     }
 
 //    DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO"Beacon 2 \n");
-    // check if CF field exisit
+    // check if CF field exists
     if (WLAN_GET_CAP_INFO_ESS(*sFrame.pwCapInfo)) {
         if (sFrame.pCFParms->wCFPDurRemaining > 0) {
             // TODO: deal with CFP period to set NAV
-        };
-    };
+        }
+    }
 
     HIDWORD(qwTimestamp) = cpu_to_le32(HIDWORD(*sFrame.pqwTimestamp));
     LODWORD(qwTimestamp) = cpu_to_le32(LODWORD(*sFrame.pqwTimestamp));
@@ -2160,7 +2160,7 @@ if(ChannelExceedZoneType(pDevice,byCurrChannel)==true)
     }
     else if (HIDWORD(qwTimestamp) < HIDWORD(qwLocalTSF)) {
         bTSFOffsetPostive = false;
-    };
+    }
 
     if (bTSFOffsetPostive) {
         qwTSFOffset = CARDqGetTSFOffset(pRxPacket->byRxRate, (qwTimestamp), (qwLocalTSF));
@@ -2218,7 +2218,7 @@ if(ChannelExceedZoneType(pDevice,byCurrChannel)==true)
                 if (pMgmt->bInTIM) {
                     PSvSendPSPOLL((PSDevice)pDevice);
 //                    DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO "BCN:PS-POLL sent..\n");
-                };
+                }
 
             }
             else {
@@ -2231,7 +2231,7 @@ if(ChannelExceedZoneType(pDevice,byCurrChannel)==true)
                 }
                 if(PSbConsiderPowerDown(pDevice, false, false)) {
                    DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO "BCN: Power down now...\n");
-                };
+                }
             }
 
         }
@@ -2244,7 +2244,7 @@ if(ChannelExceedZoneType(pDevice,byCurrChannel)==true)
 		    if (pMgmt->sNodeDBTable[0].uInActiveCount != 0)
 		 	    pMgmt->sNodeDBTable[0].uInActiveCount = 0;
 
-            // adhoc mode:TSF updated only when beacon larger then local TSF
+            // adhoc mode:TSF updated only when beacon larger than local TSF
             if (bTSFLargeDiff && bTSFOffsetPostive &&
                 (pMgmt->eCurrState == WMAC_STATE_JOINTED))
                 bUpdateTSF = true;
@@ -2252,7 +2252,7 @@ if(ChannelExceedZoneType(pDevice,byCurrChannel)==true)
             // During dpc, already in spinlocked.
             if (BSSDBbIsSTAInNodeDB(pMgmt, sFrame.pHdr->sA3.abyAddr2, &uNodeIndex)) {
 
-                // Update the STA, (Techically the Beacons of all the IBSS nodes
+                // Update the STA, (Technically the Beacons of all the IBSS nodes
 		        // should be identical, but that's not happening in practice.
                 pMgmt->abyCurrSuppRates[1] = RATEuSetIE((PWLAN_IE_SUPP_RATES)sFrame.pSuppRates,
                                                         (PWLAN_IE_SUPP_RATES)pMgmt->abyCurrSuppRates,
@@ -2305,7 +2305,7 @@ if(ChannelExceedZoneType(pDevice,byCurrChannel)==true)
 */
             }
 
-            // if other stations jointed, indicate connect to upper layer..
+            // if other stations joined, indicate connection to upper layer..
             if (pMgmt->eCurrState == WMAC_STATE_STARTED) {
                 DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO "Current IBSS State: [Started]........to: [Jointed] \n");
                 pMgmt->eCurrState = WMAC_STATE_JOINTED;
@@ -2316,7 +2316,7 @@ if(ChannelExceedZoneType(pDevice,byCurrChannel)==true)
                 pMgmt->sNodeDBTable[0].bActive = true;
                 pMgmt->sNodeDBTable[0].uInActiveCount = 0;
 
-            };
+            }
         }
         else if (bIsSSIDEqual) {
 
@@ -2356,9 +2356,9 @@ if(ChannelExceedZoneType(pDevice,byCurrChannel)==true)
                      // Prepare beacon frame
                      bMgrPrepareBeaconToSend((void *)pDevice, pMgmt);
               //  }
-            };
+            }
         }
-    };
+    }
     // endian issue ???
     // Update TSF
     if (bUpdateTSF) {
@@ -2521,14 +2521,8 @@ vMgrCreateOwnIBSS(
     if (pMgmt->eCurrMode == WMAC_MODE_ESS_AP) {
         // AP mode BSSID = MAC addr
         memcpy(pMgmt->abyCurrBSSID, pMgmt->abyMACAddr, WLAN_ADDR_LEN);
-        DBG_PRT(MSG_LEVEL_INFO, KERN_INFO"AP beacon created BSSID:%02x-%02x-%02x-%02x-%02x-%02x \n",
-                      pMgmt->abyCurrBSSID[0],
-                      pMgmt->abyCurrBSSID[1],
-                      pMgmt->abyCurrBSSID[2],
-                      pMgmt->abyCurrBSSID[3],
-                      pMgmt->abyCurrBSSID[4],
-                      pMgmt->abyCurrBSSID[5]
-                    );
+	DBG_PRT(MSG_LEVEL_INFO, KERN_INFO"AP beacon created BSSID:%pM\n",
+		pMgmt->abyCurrBSSID);
     }
 
     if (pMgmt->eCurrMode == WMAC_MODE_IBSS_STA) {
@@ -2550,14 +2544,8 @@ vMgrCreateOwnIBSS(
         pMgmt->abyCurrBSSID[0] |= IEEE_ADDR_UNIVERSAL;
 
 
-        DBG_PRT(MSG_LEVEL_INFO, KERN_INFO"Adhoc beacon created bssid:%02x-%02x-%02x-%02x-%02x-%02x \n",
-                      pMgmt->abyCurrBSSID[0],
-                      pMgmt->abyCurrBSSID[1],
-                      pMgmt->abyCurrBSSID[2],
-                      pMgmt->abyCurrBSSID[3],
-                      pMgmt->abyCurrBSSID[4],
-                      pMgmt->abyCurrBSSID[5]
-                    );
+	DBG_PRT(MSG_LEVEL_INFO, KERN_INFO"Adhoc beacon created bssid:%pM\n",
+		pMgmt->abyCurrBSSID);
     }
 
     // Set Capability Info
@@ -2590,7 +2578,7 @@ vMgrCreateOwnIBSS(
             pMgmt->byCSSPK = KEY_CTL_WEP;
             pMgmt->byCSSGK = KEY_CTL_WEP;
         }
-    };
+    }
 
     pMgmt->byERPContext = 0;
 
@@ -2683,7 +2671,7 @@ vMgrJoinBSSBegin(
        *pStatus = CMD_STATUS_RESOURCES;
         DBG_PRT(MSG_LEVEL_NOTICE, KERN_INFO "BSS finding:BSS list is empty.\n");
        return;
-    };
+    }
 
     // memset(pMgmt->abyDesireBSSID, 0,  WLAN_BSSID_LEN);
     // Search known BSS list for prefer BSSID or SSID
@@ -2699,7 +2687,7 @@ vMgrJoinBSSBegin(
        pItemSSID = (PWLAN_IE_SSID)pMgmt->abyDesireSSID;
        DBG_PRT(MSG_LEVEL_NOTICE, KERN_INFO "Scanning [%s] not found, disconnected !\n", pItemSSID->abySSID);
        return;
-    };
+    }
 
     DBG_PRT(MSG_LEVEL_NOTICE, KERN_INFO "AP(BSS) finding:Found a AP(BSS)..\n");
     if (WLAN_GET_CAP_INFO_ESS(cpu_to_le16(pCurr->wCapInfo))){
@@ -2887,14 +2875,8 @@ vMgrJoinBSSBegin(
 //            pDevice->bLinkPass = true;
 //            memcpy(pDevice->abyBSSID, pCurr->abyBSSID, WLAN_BSSID_LEN);
 
-            DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO"Join IBSS ok:%02x-%02x-%02x-%02x-%02x-%02x \n",
-                  pMgmt->abyCurrBSSID[0],
-                  pMgmt->abyCurrBSSID[1],
-                  pMgmt->abyCurrBSSID[2],
-                  pMgmt->abyCurrBSSID[3],
-                  pMgmt->abyCurrBSSID[4],
-                  pMgmt->abyCurrBSSID[5]
-                );
+		DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO"Join IBSS ok:%pM\n",
+			pMgmt->abyCurrBSSID);
             // Preamble type auto-switch: if AP can receive short-preamble cap,
             // and if registry setting is short preamble we can turn on too.
 
@@ -2984,13 +2966,8 @@ s_vMgrSynchBSS (
 
     MACvReadBSSIDAddress(pDevice->PortOffset, pMgmt->abyCurrBSSID);
 
-    DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO "Sync:set CurrBSSID address = %02x-%02x-%02x=%02x-%02x-%02x\n",
-        pMgmt->abyCurrBSSID[0],
-        pMgmt->abyCurrBSSID[1],
-        pMgmt->abyCurrBSSID[2],
-        pMgmt->abyCurrBSSID[3],
-        pMgmt->abyCurrBSSID[4],
-        pMgmt->abyCurrBSSID[5]);
+	DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO "Sync:set CurrBSSID address = "
+		"%pM\n", pMgmt->abyCurrBSSID);
 
     if (pCurr->eNetworkTypeInUse == PHY_TYPE_11A) {
         if ((pMgmt->eConfigPHYMode == PHY_TYPE_11A) ||
@@ -3104,8 +3081,8 @@ s_vMgrSynchBSS (
                //   }
            // }
   //   if( uSameBssidNum>=2) {	 //we only check AP in hidden sssid  mode
-        if ((pMgmt->eAuthenMode == WMAC_AUTH_WPAPSK) ||           //networkmanager 0.7.0 does not give the pairwise-key selsection,
-             (pMgmt->eAuthenMode == WMAC_AUTH_WPA2PSK)) {         // so we need re-selsect it according to real pairwise-key info.
+        if ((pMgmt->eAuthenMode == WMAC_AUTH_WPAPSK) ||           //networkmanager 0.7.0 does not give the pairwise-key selection,
+             (pMgmt->eAuthenMode == WMAC_AUTH_WPA2PSK)) {         // so we need re-select it according to real pairwise-key info.
                if(pCurr->bWPAValid == true)  {   //WPA-PSK
                           pMgmt->eAuthenMode = WMAC_AUTH_WPAPSK;
 		    if(pCurr->abyPKType[0] == WPA_TKIP) {
@@ -3179,7 +3156,7 @@ s_vMgrFormatTIM(
             }
             wEndIndex = ii;
         }
-    };
+    }
 
 
     // Round start index down to nearest even number
@@ -3216,7 +3193,7 @@ s_vMgrFormatTIM(
  *
  *
  * Return Value:
- *    PTR to frame; or NULL on allocation failue
+ *    PTR to frame; or NULL on allocation failure
  *
 -*/
 
@@ -3333,7 +3310,7 @@ s_MgrMakeBeacon(
             *((unsigned short *)(sFrame.pBuf + sFrame.len + sFrame.pRSNWPA->len))=0;
             sFrame.pRSNWPA->len +=2;
 
-            // RSN Capabilites
+            // RSN Capabilities
             *((unsigned short *)(sFrame.pBuf + sFrame.len + sFrame.pRSNWPA->len))=0;
             sFrame.pRSNWPA->len +=2;
             sFrame.len += sFrame.pRSNWPA->len + WLAN_IEHDR_LEN;
@@ -3443,7 +3420,7 @@ s_MgrMakeBeacon(
  *
  *
  * Return Value:
- *    PTR to frame; or NULL on allocation failue
+ *    PTR to frame; or NULL on allocation failure
  *
 -*/
 
@@ -3634,7 +3611,7 @@ s_MgrMakeProbeResponse(
  *
  *
  * Return Value:
- *    A ptr to frame or NULL on allocation failue
+ *    A ptr to frame or NULL on allocation failure
  *
 -*/
 
@@ -3675,7 +3652,7 @@ s_MgrMakeAssocRequest(
     memcpy( sFrame.pHdr->sA3.abyAddr2, pMgmt->abyMACAddr, WLAN_ADDR_LEN);
     memcpy( sFrame.pHdr->sA3.abyAddr3, pMgmt->abyCurrBSSID, WLAN_BSSID_LEN);
 
-    // Set the capibility and listen interval
+    // Set the capability and listen interval
     *(sFrame.pwCapInfo) = cpu_to_le16(wCurrCapInfo);
     *(sFrame.pwListenInterval) = cpu_to_le16(wListenInterval);
 
@@ -3785,7 +3762,7 @@ s_MgrMakeAssocRequest(
 
         sFrame.pRSNWPA->len +=6;
 
-        // RSN Capabilites
+        // RSN Capabilities
 
         *pbyRSN++=0x00;
         *pbyRSN++=0x00;
@@ -3854,7 +3831,7 @@ s_MgrMakeAssocRequest(
         }
         sFrame.pRSN->len +=6;
 
-        // RSN Capabilites
+        // RSN Capabilities
         if (pMgmt->pCurrBSS->sRSNCapObj.bRSNCapExist == true) {
             memcpy(&sFrame.pRSN->abyRSN[16], &pMgmt->pCurrBSS->sRSNCapObj.wRSNCap, 2);
         } else {
@@ -3909,7 +3886,7 @@ s_MgrMakeAssocRequest(
  *
  *
  * Return Value:
- *    A ptr to frame or NULL on allocation failue
+ *    A ptr to frame or NULL on allocation failure
  *
 -*/
 
@@ -3952,7 +3929,7 @@ s_MgrMakeReAssocRequest(
     memcpy( sFrame.pHdr->sA3.abyAddr2, pMgmt->abyMACAddr, WLAN_ADDR_LEN);
     memcpy( sFrame.pHdr->sA3.abyAddr3, pMgmt->abyCurrBSSID, WLAN_BSSID_LEN);
 
-    /* Set the capibility and listen interval */
+    /* Set the capability and listen interval */
     *(sFrame.pwCapInfo) = cpu_to_le16(wCurrCapInfo);
     *(sFrame.pwListenInterval) = cpu_to_le16(wListenInterval);
 
@@ -4042,7 +4019,7 @@ s_MgrMakeReAssocRequest(
 
         sFrame.pRSNWPA->len +=6;
 
-        // RSN Capabilites
+        // RSN Capabilities
         *pbyRSN++=0x00;
         *pbyRSN++=0x00;
         sFrame.pRSNWPA->len +=2;
@@ -4110,7 +4087,7 @@ s_MgrMakeReAssocRequest(
         }
         sFrame.pRSN->len +=6;
 
-        // RSN Capabilites
+        // RSN Capabilities
         if (pMgmt->pCurrBSS->sRSNCapObj.bRSNCapExist == true) {
             memcpy(&sFrame.pRSN->abyRSN[16], &pMgmt->pCurrBSS->sRSNCapObj.wRSNCap, 2);
         } else {
@@ -4161,7 +4138,7 @@ s_MgrMakeReAssocRequest(
  *
  *
  * Return Value:
- *    PTR to frame; or NULL on allocation failue
+ *    PTR to frame; or NULL on allocation failure
  *
 -*/
 
@@ -4235,7 +4212,7 @@ s_MgrMakeAssocResponse(
  *
  *
  * Return Value:
- *    PTR to frame; or NULL on allocation failue
+ *    PTR to frame; or NULL on allocation failure
  *
 -*/
 
@@ -4343,7 +4320,7 @@ s_vMgrRxProbeResponse(
         DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO "Probe resp:Fail addr:[%p] \n", pRxPacket->p80211Header);
         DBG_PORT80(0xCC);
         return;
-    };
+    }
 
     if(sFrame.pSSID->len == 0)
        DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO "Rx Probe resp: SSID len = 0 \n");
@@ -4356,7 +4333,7 @@ s_vMgrRxProbeResponse(
             byIEChannel = sFrame.pDSParms->byCurrChannel;
         }
         if (byCurrChannel != byIEChannel) {
-            // adjust channel info. bcs we rcv adjcent channel pakckets
+            // adjust channel info. bcs we rcv adjacent channel packets
             bChannelHit = false;
             byCurrChannel = byIEChannel;
         }
@@ -4462,14 +4439,8 @@ s_vMgrRxProbeRequest(
         sFrame.pBuf = (unsigned char *)pRxPacket->p80211Header;
         vMgrDecodeProbeRequest(&sFrame);
 /*
-        DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO "Probe request rx:MAC addr:%02x-%02x-%02x=%02x-%02x-%02x \n",
-                  sFrame.pHdr->sA3.abyAddr2[0],
-                  sFrame.pHdr->sA3.abyAddr2[1],
-                  sFrame.pHdr->sA3.abyAddr2[2],
-                  sFrame.pHdr->sA3.abyAddr2[3],
-                  sFrame.pHdr->sA3.abyAddr2[4],
-                  sFrame.pHdr->sA3.abyAddr2[5]
-                );
+	DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO "Probe request rx:MAC addr:%pM\n",
+		sFrame.pHdr->sA3.abyAddr2);
 */
         if (sFrame.pSSID->len != 0) {
             if (sFrame.pSSID->len != ((PWLAN_IE_SSID)pMgmt->abyCurrSSID)->len)
@@ -4625,7 +4596,7 @@ vMgrRxManagePacket(
             //DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO "rx beacon\n");
             if (pMgmt->eScanState != WMAC_NO_SCANNING) {
                 bInScan = true;
-            };
+            }
             s_vMgrRxBeacon(pDevice, pMgmt, pRxPacket, bInScan);
             break;
 

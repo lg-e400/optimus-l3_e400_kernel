@@ -250,6 +250,20 @@ static void bcm_uart_do_rx(struct uart_port *port)
 		/* get overrun/fifo empty information from ier
 		 * register */
 		iestat = bcm_uart_readl(port, UART_IR_REG);
+
+		if (unlikely(iestat & UART_IR_STAT(UART_IR_RXOVER))) {
+			unsigned int val;
+
+			/* fifo reset is required to clear
+			 * interrupt */
+			val = bcm_uart_readl(port, UART_CTL_REG);
+			val |= UART_CTL_RSTRXFIFO_MASK;
+			bcm_uart_writel(port, val, UART_CTL_REG);
+
+			port->icount.overrun++;
+			tty_insert_flip_char(tty, 0, TTY_OVERRUN);
+		}
+
 		if (!(iestat & UART_IR_STAT(UART_IR_RXNOTEMPTY)))
 			break;
 
@@ -284,10 +298,6 @@ static void bcm_uart_do_rx(struct uart_port *port)
 		if (uart_handle_sysrq_char(port, c))
 			continue;
 
-		if (unlikely(iestat & UART_IR_STAT(UART_IR_RXOVER))) {
-			port->icount.overrun++;
-			tty_insert_flip_char(tty, 0, TTY_OVERRUN);
-		}
 
 		if ((cstat & port->ignore_status_mask) == 0)
 			tty_insert_flip_char(tty, c, flag);
@@ -791,7 +801,7 @@ static struct uart_driver bcm_uart_driver = {
 /*
  * platform driver probe/remove callback
  */
-static int __devinit bcm_uart_probe(struct platform_device *pdev)
+static int bcm_uart_probe(struct platform_device *pdev)
 {
 	struct resource *res_mem, *res_irq;
 	struct uart_port *port;
@@ -838,7 +848,7 @@ static int __devinit bcm_uart_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int __devexit bcm_uart_remove(struct platform_device *pdev)
+static int bcm_uart_remove(struct platform_device *pdev)
 {
 	struct uart_port *port;
 
@@ -855,7 +865,7 @@ static int __devexit bcm_uart_remove(struct platform_device *pdev)
  */
 static struct platform_driver bcm_uart_platform_driver = {
 	.probe	= bcm_uart_probe,
-	.remove	= __devexit_p(bcm_uart_remove),
+	.remove	= bcm_uart_remove,
 	.driver	= {
 		.owner = THIS_MODULE,
 		.name  = "bcm63xx_uart",

@@ -7,13 +7,13 @@
  *
  * Modified:
  *               Copyright 2009 Analog Devices Inc.
- * Copyright (c) 2011, Code Aurora Forum. All rights reserved.
  *
  * Bugs:         Enter bugs at http://blackfin.uclinux.org/
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; only version 2 of the License.
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -154,7 +154,12 @@ static snd_pcm_uframes_t bf5xx_pcm_pointer(struct snd_pcm_substream *substream)
 
 static int bf5xx_pcm_open(struct snd_pcm_substream *substream)
 {
+	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+	struct snd_soc_dai *cpu_dai = rtd->cpu_dai;
+	struct sport_device *sport_handle = snd_soc_dai_get_drvdata(cpu_dai);
 	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct snd_dma_buffer *buf = &substream->dma_buffer;
+
 	int ret = 0;
 
 	snd_soc_set_runtime_hwparams(substream, &bf5xx_pcm_hardware);
@@ -164,9 +169,14 @@ static int bf5xx_pcm_open(struct snd_pcm_substream *substream)
 	if (ret < 0)
 		goto out;
 
-	if (sport_handle != NULL)
+	if (sport_handle != NULL) {
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+			sport_handle->tx_buf = buf->area;
+		else
+			sport_handle->rx_buf = buf->area;
+
 		runtime->private_data = sport_handle;
-	else {
+	} else {
 		pr_err("sport_handle is NULL\n");
 		ret = -ENODEV;
 	}
@@ -249,11 +259,6 @@ static int bf5xx_pcm_preallocate_dma_buffer(struct snd_pcm *pcm, int stream)
 	}
 	buf->bytes = size;
 
-	if (stream == SNDRV_PCM_STREAM_PLAYBACK)
-		sport_handle->tx_buf = buf->area;
-	else
-		sport_handle->rx_buf = buf->area;
-
 	return 0;
 }
 
@@ -274,8 +279,6 @@ static void bf5xx_pcm_free_dma_buffers(struct snd_pcm *pcm)
 		dma_free_coherent(NULL, buf->bytes, buf->area, 0);
 		buf->area = NULL;
 	}
-	if (sport_handle)
-		sport_done(sport_handle);
 }
 
 static u64 bf5xx_pcm_dmamask = DMA_BIT_MASK(32);
@@ -283,7 +286,6 @@ static u64 bf5xx_pcm_dmamask = DMA_BIT_MASK(32);
 static int bf5xx_pcm_tdm_new(struct snd_soc_pcm_runtime *rtd)
 {
 	struct snd_card *card = rtd->card->snd_card;
-	struct snd_soc_dai *dai = rtd->cpu_dai;
 	struct snd_pcm *pcm = rtd->pcm;
 	int ret = 0;
 
@@ -292,14 +294,14 @@ static int bf5xx_pcm_tdm_new(struct snd_soc_pcm_runtime *rtd)
 	if (!card->dev->coherent_dma_mask)
 		card->dev->coherent_dma_mask = DMA_BIT_MASK(32);
 
-	if (dai->driver->playback.channels_min) {
+	if (pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream) {
 		ret = bf5xx_pcm_preallocate_dma_buffer(pcm,
 			SNDRV_PCM_STREAM_PLAYBACK);
 		if (ret)
 			goto out;
 	}
 
-	if (dai->driver->capture.channels_min) {
+	if (pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream) {
 		ret = bf5xx_pcm_preallocate_dma_buffer(pcm,
 			SNDRV_PCM_STREAM_CAPTURE);
 		if (ret)
@@ -315,12 +317,12 @@ static struct snd_soc_platform_driver bf5xx_tdm_soc_platform = {
 	.pcm_free       = bf5xx_pcm_free_dma_buffers,
 };
 
-static int __devinit bf5xx_soc_platform_probe(struct platform_device *pdev)
+static int bf5xx_soc_platform_probe(struct platform_device *pdev)
 {
 	return snd_soc_register_platform(&pdev->dev, &bf5xx_tdm_soc_platform);
 }
 
-static int __devexit bf5xx_soc_platform_remove(struct platform_device *pdev)
+static int bf5xx_soc_platform_remove(struct platform_device *pdev)
 {
 	snd_soc_unregister_platform(&pdev->dev);
 	return 0;
@@ -328,26 +330,16 @@ static int __devexit bf5xx_soc_platform_remove(struct platform_device *pdev)
 
 static struct platform_driver bfin_tdm_driver = {
 	.driver = {
-			.name = "bf5xx-tdm-pcm-audio",
+			.name = "bfin-tdm-pcm-audio",
 			.owner = THIS_MODULE,
 	},
 
 	.probe = bf5xx_soc_platform_probe,
-	.remove = __devexit_p(bf5xx_soc_platform_remove),
+	.remove = bf5xx_soc_platform_remove,
 };
 
-static int __init snd_bfin_tdm_init(void)
-{
-	return platform_driver_register(&bfin_tdm_driver);
-}
-module_init(snd_bfin_tdm_init);
-
-static void __exit snd_bfin_tdm_exit(void)
-{
-	platform_driver_unregister(&bfin_tdm_driver);
-}
-module_exit(snd_bfin_tdm_exit);
+module_platform_driver(bfin_tdm_driver);
 
 MODULE_AUTHOR("Barry Song");
 MODULE_DESCRIPTION("ADI Blackfin TDM PCM DMA module");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

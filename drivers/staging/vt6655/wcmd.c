@@ -121,7 +121,7 @@ vAdHocBeaconStop(PSDevice  pDevice)
 
     /*
      * temporarily stop Beacon packet for AdHoc Server
-     * if all of the following coditions are met:
+     * if all of the following conditions are met:
      *  (1) STA is in AdHoc mode
      *  (2) VT3253 is programmed as automatic Beacon Transmitting
      *  (3) One of the following conditions is met
@@ -385,7 +385,7 @@ vCommandTimer (
                 spin_unlock_irq(&pDevice->lock);
                 vCommandTimerWait((void *)pDevice, 10);
                 return;
-            };
+            }
 
             if (pMgmt->uScanChannel == 0 ) {
                 pMgmt->uScanChannel = pDevice->byMinChannel;
@@ -412,6 +412,7 @@ vCommandTimer (
 		if (!is_channel_valid(pMgmt->uScanChannel)) {
                     DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO "Invalid channel pMgmt->uScanChannel = %d \n",pMgmt->uScanChannel);
                     s_bCommandComplete(pDevice);
+                    spin_unlock_irq(&pDevice->lock);
                     return;
                 }
 //printk("chester-pMgmt->uScanChannel=%d,pDevice->byMaxChannel=%d\n",pMgmt->uScanChannel,pDevice->byMaxChannel);
@@ -519,7 +520,7 @@ vCommandTimer (
                 vCommandTimerWait((void *)pDevice, 10);
                 spin_unlock_irq(&pDevice->lock);
                 return;
-            };
+            }
             DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO" CARDbRadioPowerOff\n");
 	//2008-09-02  <mark>	by chester
            // CARDbRadioPowerOff(pDevice);
@@ -532,7 +533,7 @@ vCommandTimer (
                 vCommandTimerWait((void *)pDevice, 10);
                 spin_unlock_irq(&pDevice->lock);
                 return;
-            };
+            }
 //2008-09-02  <mark> by chester
            // CARDbRadioPowerOff(pDevice);
             s_bCommandComplete(pDevice);
@@ -587,7 +588,7 @@ printk("chester-abyDesireSSID=%s\n",((PWLAN_IE_SSID)pMgmt->abyDesireSSID)->abySS
             if ((pMgmt->eCurrMode == WMAC_MODE_ESS_STA) && (pMgmt->eCurrState == WMAC_STATE_JOINTED)) {
 
 		// Call mgr to begin the deauthentication
-                // reason = (3) beacuse sta has left ESS
+                // reason = (3) because sta has left ESS
                 if (pMgmt->eCurrState>= WMAC_STATE_AUTH) {
                     vMgrDeAuthenBeginSta((void *)pDevice, pMgmt, pMgmt->abyCurrBSSID, (3), &Status);
                 }
@@ -619,7 +620,7 @@ printk("chester-abyDesireSSID=%s\n",((PWLAN_IE_SSID)pMgmt->abyDesireSSID)->abySS
                     vMgrCreateOwnIBSS((void *)pDevice, &Status);
                     if (Status != CMD_STATUS_SUCCESS){
                         DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO " WLAN_CMD_IBSS_CREATE fail ! \n");
-                    };
+                    }
                     BSSvAddMulticastNode(pDevice);
                 }
             }
@@ -631,7 +632,7 @@ printk("chester-abyDesireSSID=%s\n",((PWLAN_IE_SSID)pMgmt->abyDesireSSID)->abySS
                     vMgrCreateOwnIBSS((void *)pDevice, &Status);
                     if (Status != CMD_STATUS_SUCCESS){
                         DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO" WLAN_CMD_IBSS_CREATE fail ! \n");
-                    };
+                    }
                     BSSvAddMulticastNode(pDevice);
                     if (netif_queue_stopped(pDevice->dev)){
                         netif_wake_queue(pDevice->dev);
@@ -684,18 +685,6 @@ printk("chester-abyDesireSSID=%s\n",((PWLAN_IE_SSID)pMgmt->abyDesireSSID)->abySS
 	       return;
 	   }
 	          pDevice->byLinkWaitCount = 0;
-		 #if 0
-                     #ifdef WPA_SUPPLICANT_DRIVER_WEXT_SUPPORT
-                    // if(pDevice->bWPASuppWextEnabled == true)
-                        {
-                  	union iwreq_data  wrqu;
-                  	memset(&wrqu, 0, sizeof (wrqu));
-                          wrqu.ap_addr.sa_family = ARPHRD_ETHER;
-                  	printk("wireless_send_event--->SIOCGIWAP(disassociated:AUTHENTICATE_WAIT_timeout)\n");
-                  	wireless_send_event(pDevice->dev, SIOCGIWAP, &wrqu, NULL);
-                       }
-                    #endif
-	         #endif
             s_bCommandComplete(pDevice);
             break;
 
@@ -748,18 +737,6 @@ printk("chester-abyDesireSSID=%s\n",((PWLAN_IE_SSID)pMgmt->abyDesireSSID)->abySS
 	       return;
 	   }
 	          pDevice->byLinkWaitCount = 0;
-		#if 0
-                     #ifdef WPA_SUPPLICANT_DRIVER_WEXT_SUPPORT
-                    // if(pDevice->bWPASuppWextEnabled == true)
-                        {
-                  	union iwreq_data  wrqu;
-                  	memset(&wrqu, 0, sizeof (wrqu));
-                          wrqu.ap_addr.sa_family = ARPHRD_ETHER;
-                  	printk("wireless_send_event--->SIOCGIWAP(disassociated:ASSOCIATE_WAIT_timeout)\n");
-                  	wireless_send_event(pDevice->dev, SIOCGIWAP, &wrqu, NULL);
-                       }
-                    #endif
-		#endif
 
             s_bCommandComplete(pDevice);
             break;
@@ -783,7 +760,7 @@ printk("chester-abyDesireSSID=%s\n",((PWLAN_IE_SSID)pMgmt->abyDesireSSID)->abySS
                 vMgrCreateOwnIBSS((void *)pDevice, &Status);
                 if (Status != CMD_STATUS_SUCCESS){
                     DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO " vMgrCreateOwnIBSS fail ! \n");
-                };
+                }
                 // alway turn off unicast bit
                 MACvRegBitsOff(pDevice->PortOffset, MAC_REG_RCR, RCR_UNICAST);
                 pDevice->byRxMode &= ~RCR_UNICAST;
@@ -814,7 +791,7 @@ printk("chester-abyDesireSSID=%s\n",((PWLAN_IE_SSID)pMgmt->abyDesireSSID)->abySS
                     }
                     pMgmt->sNodeDBTable[0].wEnQueueCnt--;
                 }
-            };
+            }
 
             // PS nodes tx
             for (ii = 1; ii < (MAX_NODE_NUM + 1); ii++) {
@@ -836,8 +813,8 @@ printk("chester-abyDesireSSID=%s\n",((PWLAN_IE_SSID)pMgmt->abyDesireSSID)->abySS
                             DBG_PRT(MSG_LEVEL_DEBUG, KERN_INFO "sta ps tx fail \n");
                         }
                         pMgmt->sNodeDBTable[ii].wEnQueueCnt--;
-                        // check if sta ps enable, wait next pspoll
-                        // if sta ps disable, send all pending buffers.
+                        // check if sta ps enabled, and wait next pspoll.
+                        // if sta ps disable, then send all pending buffers.
                         if (pMgmt->sNodeDBTable[ii].bPSEnable)
                             break;
                     }

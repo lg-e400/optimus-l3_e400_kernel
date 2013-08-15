@@ -52,7 +52,7 @@
 #define TMA1217_DEV_STATUS		0x13	/* Device Status */
 #define TMA1217_INT_STATUS		0x14	/* Interrupt Status */
 
-/* Controller can detect upto 2 possible finger touches.
+/* Controller can detect up to 2 possible finger touches.
  * Each finger touch provides  12 bit X Y co-ordinates, the values are split
  * across 2 registers, and an 8 bit  Z value */
 #define TMA1217_FINGER_STATE		0x18 /* Finger State */
@@ -396,8 +396,8 @@ static int cp_tm1217_setup_gpio_irq(struct cp_tm1217_device *ts)
 
 	retval = gpio_to_irq(ts->gpio);
 	if (retval < 0) {
-		dev_err(ts->dev, "cp_tm1217: GPIO to IRQ failedi,"
-		" error %d\n", retval);
+		dev_err(ts->dev,
+			"cp_tm1217: GPIO to IRQ failed, error %d\n", retval);
 		gpio_free(ts->gpio);
 	}
 	dev_dbg(ts->dev,
@@ -462,8 +462,8 @@ static int cp_tm1217_probe(struct i2c_client *client,
 		if (input_dev == NULL) {
 			dev_err(ts->dev,
 				"cp_tm1217:Input Device Struct alloc failed\n");
-			kfree(ts);
-			return -ENOMEM;
+			retval = -ENOMEM;
+			goto fail;
 		}
 		input_info = &ts->cp_input_info[i];
 		snprintf(input_info->name, sizeof(input_info->name),
@@ -486,6 +486,7 @@ static int cp_tm1217_probe(struct i2c_client *client,
 			dev_err(ts->dev,
 				"Input dev registration failed for %s\n",
 					input_dev->name);
+			input_free_device(input_dev);
 			goto fail;
 		}
 		input_info->input = input_dev;
@@ -657,18 +658,7 @@ static struct i2c_driver cp_tm1217_driver = {
 	.resume     = cp_tm1217_resume,
 };
 
-static int __init clearpad_tm1217_init(void)
-{
-	return i2c_add_driver(&cp_tm1217_driver);
-}
-
-static void __exit clearpad_tm1217_exit(void)
-{
-	i2c_del_driver(&cp_tm1217_driver);
-}
-
-module_init(clearpad_tm1217_init);
-module_exit(clearpad_tm1217_exit);
+module_i2c_driver(cp_tm1217_driver);
 
 MODULE_AUTHOR("Ramesh Agarwal <ramesh.agarwal@intel.com>");
 MODULE_DESCRIPTION("Synaptics TM1217 TouchScreen Driver");

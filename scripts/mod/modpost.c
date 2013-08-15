@@ -37,8 +37,6 @@ static int all_versions = 0;
 static int external_module = 0;
 /* Warn about section mismatch in vmlinux if set to 1 */
 static int vmlinux_section_warnings = 1;
-/* Exit with an error when there is a section mismatch if set to 1 */
-static int section_error_on_mismatch;
 /* Only warn about unresolved symbols */
 static int warn_unresolved = 0;
 /* How a symbol is exported */
@@ -134,8 +132,10 @@ static struct module *new_module(char *modname)
 	/* strip trailing .o */
 	s = strrchr(p, '.');
 	if (s != NULL)
-		if (strcmp(s, ".o") == 0)
+		if (strcmp(s, ".o") == 0) {
 			*s = '\0';
+			mod->is_dot_o = 1;
+		}
 
 	/* add to list */
 	mod->name = p;
@@ -256,6 +256,28 @@ static enum export export_no(const char *s)
 	return export_unknown;
 }
 
+static const char *sec_name(struct elf_info *elf, int secindex);
+
+#define strstarts(str, prefix) (strncmp(str, prefix, strlen(prefix)) == 0)
+
+static enum export export_from_secname(struct elf_info *elf, unsigned int sec)
+{
+	const char *secname = sec_name(elf, sec);
+
+	if (strstarts(secname, "___ksymtab+"))
+		return export_plain;
+	else if (strstarts(secname, "___ksymtab_unused+"))
+		return export_unused;
+	else if (strstarts(secname, "___ksymtab_gpl+"))
+		return export_gpl;
+	else if (strstarts(secname, "___ksymtab_unused_gpl+"))
+		return export_unused_gpl;
+	else if (strstarts(secname, "___ksymtab_gpl_future+"))
+		return export_gpl_future;
+	else
+		return export_unknown;
+}
+
 static enum export export_from_sec(struct elf_info *elf, unsigned int sec)
 {
 	if (sec == elf->export_sec)
@@ -315,17 +337,20 @@ static void sym_update_crc(const char *name, struct module *mod,
 void *grab_file(const char *filename, unsigned long *size)
 {
 	struct stat st;
-	void *map;
+	void *map = MAP_FAILED;
 	int fd;
 
 	fd = open(filename, O_RDONLY);
-	if (fd < 0 || fstat(fd, &st) != 0)
+	if (fd < 0)
 		return NULL;
+	if (fstat(fd, &st))
+		goto failed;
 
 	*size = st.st_size;
 	map = mmap(NULL, *size, PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
-	close(fd);
 
+failed:
+	close(fd);
 	if (map == MAP_FAILED)
 		return NULL;
 	return map;
@@ -422,11 +447,10 @@ static int parse_elf(struct elf_info *info, const char *filename)
 		return 0;
 	}
 
-	if (hdr->e_shnum == 0) {
+	if (hdr->e_shnum == SHN_UNDEF) {
 		/*
 		 * There are more than 64k sections,
 		 * read count from .sh_size.
-		 * note: it doesn't need shndx2secindex()
 		 */
 		info->num_sections = TO_NATIVE(sechdrs[0].sh_size);
 	}
@@ -434,8 +458,7 @@ static int parse_elf(struct elf_info *info, const char *filename)
 		info->num_sections = hdr->e_shnum;
 	}
 	if (hdr->e_shstrndx == SHN_XINDEX) {
-		info->secindex_strings =
-		    shndx2secindex(TO_NATIVE(sechdrs[0].sh_link));
+		info->secindex_strings = TO_NATIVE(sechdrs[0].sh_link);
 	}
 	else {
 		info->secindex_strings = hdr->e_shstrndx;
@@ -491,7 +514,7 @@ static int parse_elf(struct elf_info *info, const char *filename)
 			    sechdrs[i].sh_offset;
 			info->symtab_stop  = (void *)hdr +
 			    sechdrs[i].sh_offset + sechdrs[i].sh_size;
-			sh_link_idx = shndx2secindex(sechdrs[i].sh_link);
+			sh_link_idx = sechdrs[i].sh_link;
 			info->strtab       = (void *)hdr +
 			    sechdrs[sh_link_idx].sh_offset;
 		}
@@ -518,11 +541,9 @@ static int parse_elf(struct elf_info *info, const char *filename)
 
 	if (symtab_shndx_idx != ~0U) {
 		Elf32_Word *p;
-		if (symtab_idx !=
-		    shndx2secindex(sechdrs[symtab_shndx_idx].sh_link))
+		if (symtab_idx != sechdrs[symtab_shndx_idx].sh_link)
 			fatal("%s: SYMTAB_SHNDX has bad sh_link: %u!=%u\n",
-			      filename,
-			      shndx2secindex(sechdrs[symtab_shndx_idx].sh_link),
+			      filename, sechdrs[symtab_shndx_idx].sh_link,
 			      symtab_idx);
 		/* Fix endianness */
 		for (p = info->symtab_shndx_start; p < info->symtab_shndx_stop;
@@ -569,7 +590,13 @@ static void handle_modversions(struct module *mod, struct elf_info *info,
 			       Elf_Sym *sym, const char *symname)
 {
 	unsigned int crc;
-	enum export export = export_from_sec(info, get_secindex(info, sym));
+	enum export export;
+
+	if ((!is_vmlinux(mod->name) || mod->is_dot_o) &&
+	    strncmp(symname, "__ksymtab", 9) == 0)
+		export = export_from_secname(info, get_secindex(info, sym));
+	else
+		export = export_from_sec(info, get_secindex(info, sym));
 
 	switch (sym->st_shndx) {
 	case SHN_COMMON:
@@ -794,12 +821,15 @@ static const char *section_white_list[] =
 	".debug*",
 	".zdebug*",		/* Compressed debug sections. */
 	".GCC-command-line",	/* mn10300 */
+	".GCC.command.line",	/* record-gcc-switches, non mn10300 */
 	".mdebug*",        /* alpha, score, mips etc. */
 	".pdr",            /* alpha, score, mips etc. */
 	".stab*",
 	".note*",
 	".got*",
 	".toc*",
+	".xt.prop",				 /* xtensa */
+	".xt.lit",         /* xtensa */
 	NULL
 };
 
@@ -828,20 +858,23 @@ static void check_section(const char *modname, struct elf_info *elf,
 
 #define ALL_INIT_DATA_SECTIONS \
 	".init.setup$", ".init.rodata$", \
-	".devinit.rodata$", ".cpuinit.rodata$", ".meminit.rodata$" \
-	".init.data$", ".devinit.data$", ".cpuinit.data$", ".meminit.data$"
+	".cpuinit.rodata$", ".meminit.rodata$", \
+	".init.data$", ".cpuinit.data$", ".meminit.data$"
 #define ALL_EXIT_DATA_SECTIONS \
-	".exit.data$", ".devexit.data$", ".cpuexit.data$", ".memexit.data$"
+	".exit.data$", ".cpuexit.data$", ".memexit.data$"
 
 #define ALL_INIT_TEXT_SECTIONS \
-	".init.text$", ".devinit.text$", ".cpuinit.text$", ".meminit.text$"
+	".init.text$", ".cpuinit.text$", ".meminit.text$"
 #define ALL_EXIT_TEXT_SECTIONS \
-	".exit.text$", ".devexit.text$", ".cpuexit.text$", ".memexit.text$"
+	".exit.text$", ".cpuexit.text$", ".memexit.text$"
 
-#define ALL_XXXINIT_SECTIONS DEV_INIT_SECTIONS, CPU_INIT_SECTIONS, \
-	MEM_INIT_SECTIONS
-#define ALL_XXXEXIT_SECTIONS DEV_EXIT_SECTIONS, CPU_EXIT_SECTIONS, \
-	MEM_EXIT_SECTIONS
+#define ALL_PCI_INIT_SECTIONS	\
+	".pci_fixup_early$", ".pci_fixup_header$", ".pci_fixup_final$", \
+	".pci_fixup_enable$", ".pci_fixup_resume$", \
+	".pci_fixup_resume_early$", ".pci_fixup_suspend$"
+
+#define ALL_XXXINIT_SECTIONS CPU_INIT_SECTIONS, MEM_INIT_SECTIONS
+#define ALL_XXXEXIT_SECTIONS CPU_EXIT_SECTIONS, MEM_EXIT_SECTIONS
 
 #define ALL_INIT_SECTIONS INIT_SECTIONS, ALL_XXXINIT_SECTIONS
 #define ALL_EXIT_SECTIONS EXIT_SECTIONS, ALL_XXXEXIT_SECTIONS
@@ -850,12 +883,10 @@ static void check_section(const char *modname, struct elf_info *elf,
 #define TEXT_SECTIONS ".text$"
 
 #define INIT_SECTIONS      ".init.*"
-#define DEV_INIT_SECTIONS  ".devinit.*"
 #define CPU_INIT_SECTIONS  ".cpuinit.*"
 #define MEM_INIT_SECTIONS  ".meminit.*"
 
 #define EXIT_SECTIONS      ".exit.*"
-#define DEV_EXIT_SECTIONS  ".devexit.*"
 #define CPU_EXIT_SECTIONS  ".cpuexit.*"
 #define MEM_EXIT_SECTIONS  ".memexit.*"
 
@@ -944,7 +975,7 @@ const struct sectioncheck sectioncheck[] = {
 	.mismatch = DATA_TO_ANY_EXIT,
 	.symbol_white_list = { DEFAULT_SYMBOL_WHITE_LIST, NULL },
 },
-/* Do not reference init code/data from devinit/cpuinit/meminit code/data */
+/* Do not reference init code/data from cpuinit/meminit code/data */
 {
 	.fromsec = { ALL_XXXINIT_SECTIONS, NULL },
 	.tosec   = { INIT_SECTIONS, NULL },
@@ -965,7 +996,7 @@ const struct sectioncheck sectioncheck[] = {
 	.mismatch = XXXINIT_TO_SOME_INIT,
 	.symbol_white_list = { DEFAULT_SYMBOL_WHITE_LIST, NULL },
 },
-/* Do not reference exit code/data from devexit/cpuexit/memexit code/data */
+/* Do not reference exit code/data from cpuexit/memexit code/data */
 {
 	.fromsec = { ALL_XXXEXIT_SECTIONS, NULL },
 	.tosec   = { EXIT_SECTIONS, NULL },
@@ -999,6 +1030,12 @@ const struct sectioncheck sectioncheck[] = {
 	.tosec   = { ALL_INIT_SECTIONS, NULL },
 	.mismatch = ANY_EXIT_TO_ANY_INIT,
 	.symbol_white_list = { DEFAULT_SYMBOL_WHITE_LIST, NULL },
+},
+{
+	.fromsec = { ALL_PCI_INIT_SECTIONS, NULL },
+	.tosec   = { INIT_SECTIONS, NULL },
+	.mismatch = ANY_INIT_TO_ANY_EXIT,
+	.symbol_white_list = { NULL },
 },
 /* Do not export init/exit functions or data */
 {
@@ -1048,7 +1085,7 @@ static const struct sectioncheck *section_mismatch(
  * Pattern 2:
  *   Many drivers utilise a *driver container with references to
  *   add, remove, probe functions etc.
- *   These functions may often be marked __devinit and we do not want to
+ *   These functions may often be marked __cpuinit and we do not want to
  *   warn here.
  *   the pattern is identified by:
  *   tosec   = init or exit section
@@ -1250,6 +1287,19 @@ static int is_function(Elf_Sym *sym)
 		return -1;
 }
 
+static void print_section_list(const char * const list[20])
+{
+	const char *const *s = list;
+
+	while (*s) {
+		fprintf(stderr, "%s", *s);
+		s++;
+		if (*s)
+			fprintf(stderr, ", ");
+	}
+	fprintf(stderr, "\n");
+}
+
 /*
  * Print a warning about a section mismatch.
  * Try to find symbols near it so user can find it.
@@ -1306,7 +1356,6 @@ static void report_sec_mismatch(const char *modname,
 		break;
 	case DATA_TO_ANY_INIT: {
 		prl_to = sec2annotation(tosec);
-		const char *const *s = mismatch->symbol_white_list;
 		fprintf(stderr,
 		"The variable %s references\n"
 		"the %s %s%s%s\n"
@@ -1314,9 +1363,7 @@ static void report_sec_mismatch(const char *modname,
 		"variable with __init* or __refdata (see linux/init.h) "
 		"or name the variable:\n",
 		fromsym, to, prl_to, tosym, to_p);
-		while (*s)
-			fprintf(stderr, "%s, ", *s++);
-		fprintf(stderr, "\n");
+		print_section_list(mismatch->symbol_white_list);
 		free(prl_to);
 		break;
 	}
@@ -1331,7 +1378,6 @@ static void report_sec_mismatch(const char *modname,
 		break;
 	case DATA_TO_ANY_EXIT: {
 		prl_to = sec2annotation(tosec);
-		const char *const *s = mismatch->symbol_white_list;
 		fprintf(stderr,
 		"The variable %s references\n"
 		"the %s %s%s%s\n"
@@ -1339,9 +1385,7 @@ static void report_sec_mismatch(const char *modname,
 		"variable with __exit* (see linux/init.h) or "
 		"name the variable:\n",
 		fromsym, to, prl_to, tosym, to_p);
-		while (*s)
-			fprintf(stderr, "%s, ", *s++);
-		fprintf(stderr, "\n");
+		print_section_list(mismatch->symbol_white_list);
 		free(prl_to);
 		break;
 	}
@@ -1441,7 +1485,7 @@ static unsigned int *reloc_location(struct elf_info *elf,
 				    Elf_Shdr *sechdr, Elf_Rela *r)
 {
 	Elf_Shdr *sechdrs = elf->sechdrs;
-	int section = shndx2secindex(sechdr->sh_info);
+	int section = sechdr->sh_info;
 
 	return (void *)elf->hdr + sechdrs[section].sh_offset +
 		r->r_offset;
@@ -1466,6 +1510,13 @@ static int addend_386_rel(struct elf_info *elf, Elf_Shdr *sechdr, Elf_Rela *r)
 	return 0;
 }
 
+#ifndef R_ARM_CALL
+#define R_ARM_CALL	28
+#endif
+#ifndef R_ARM_JUMP24
+#define R_ARM_JUMP24	29
+#endif
+
 static int addend_arm_rel(struct elf_info *elf, Elf_Shdr *sechdr, Elf_Rela *r)
 {
 	unsigned int r_typ = ELF_R_TYPE(r->r_info);
@@ -1477,6 +1528,8 @@ static int addend_arm_rel(struct elf_info *elf, Elf_Shdr *sechdr, Elf_Rela *r)
 		              (elf->symtab_start + ELF_R_SYM(r->r_info));
 		break;
 	case R_ARM_PC24:
+	case R_ARM_CALL:
+	case R_ARM_JUMP24:
 		/* From ARM ABI: ((S + A) | T) - P */
 		r->r_addend = (int)(long)(elf->hdr +
 		              sechdr->sh_offset +
@@ -1810,15 +1863,21 @@ static void add_header(struct buffer *b, struct module *mod)
 	buf_printf(b, "\n");
 	buf_printf(b, "struct module __this_module\n");
 	buf_printf(b, "__attribute__((section(\".gnu.linkonce.this_module\"))) = {\n");
-	buf_printf(b, " .name = KBUILD_MODNAME,\n");
+	buf_printf(b, "\t.name = KBUILD_MODNAME,\n");
 	if (mod->has_init)
-		buf_printf(b, " .init = init_module,\n");
+		buf_printf(b, "\t.init = init_module,\n");
 	if (mod->has_cleanup)
 		buf_printf(b, "#ifdef CONFIG_MODULE_UNLOAD\n"
-			      " .exit = cleanup_module,\n"
+			      "\t.exit = cleanup_module,\n"
 			      "#endif\n");
-	buf_printf(b, " .arch = MODULE_ARCH_INIT,\n");
+	buf_printf(b, "\t.arch = MODULE_ARCH_INIT,\n");
 	buf_printf(b, "};\n");
+}
+
+static void add_intree_flag(struct buffer *b, int is_intree)
+{
+	if (is_intree)
+		buf_printf(b, "\nMODULE_INFO(intree, \"Y\");\n");
 }
 
 static void add_staging_flag(struct buffer *b, const char *name)
@@ -2067,7 +2126,7 @@ int main(int argc, char **argv)
 	struct ext_sym_list *extsym_iter;
 	struct ext_sym_list *extsym_start = NULL;
 
-	while ((opt = getopt(argc, argv, "i:I:e:cmsSo:awM:K:E")) != -1) {
+	while ((opt = getopt(argc, argv, "i:I:e:cmsSo:awM:K:")) != -1) {
 		switch (opt) {
 		case 'i':
 			kernel_read = optarg;
@@ -2105,9 +2164,6 @@ int main(int argc, char **argv)
 		case 'w':
 			warn_unresolved = 1;
 			break;
-		case 'E':
-			section_error_on_mismatch = 1;
-			break;
 		default:
 			exit(1);
 		}
@@ -2144,6 +2200,7 @@ int main(int argc, char **argv)
 		buf.pos = 0;
 
 		add_header(&buf, mod);
+		add_intree_flag(&buf, !external_module);
 		add_staging_flag(&buf, mod->name);
 		err |= add_versions(&buf, mod);
 		add_depends(&buf, mod, modules);
@@ -2156,23 +2213,11 @@ int main(int argc, char **argv)
 
 	if (dump_write)
 		write_dump(dump_write);
-
-	if (sec_mismatch_count && !sec_mismatch_verbose) {
-		merror(
-		"modpost: Found %d section mismatch(es).\n"
-		"To see full details build your kernel with:\n"
-		"'make CONFIG_DEBUG_SECTION_MISMATCH=y'\n",
-		sec_mismatch_count);
-
-	}
-
-	if (sec_mismatch_count && section_error_on_mismatch) {
-		err |= 1;
-		printf(
-		"To build the kernel despite the mismatches, "
-		"build with:\n'make CONFIG_NO_ERROR_ON_MISMATCH=y'\n"
-		"(NOTE: This is not recommended)\n");
-	}
+	if (sec_mismatch_count && !sec_mismatch_verbose)
+		warn("modpost: Found %d section mismatch(es).\n"
+		     "To see full details build your kernel with:\n"
+		     "'make CONFIG_DEBUG_SECTION_MISMATCH=y'\n",
+		     sec_mismatch_count);
 
 	return err;
 }

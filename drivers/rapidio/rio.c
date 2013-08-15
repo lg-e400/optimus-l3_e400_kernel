@@ -32,6 +32,8 @@
 #include "rio.h"
 
 static LIST_HEAD(rio_mports);
+static unsigned char next_portid;
+static DEFINE_SPINLOCK(rio_mmap_lock);
 
 /**
  * rio_local_get_device_id - Get the base/extended device id for a port
@@ -68,9 +70,13 @@ int rio_request_inb_mbox(struct rio_mport *mport,
 			 void (*minb) (struct rio_mport * mport, void *dev_id, int mbox,
 				       int slot))
 {
-	int rc = 0;
+	int rc = -ENOSYS;
+	struct resource *res;
 
-	struct resource *res = kmalloc(sizeof(struct resource), GFP_KERNEL);
+	if (mport->ops->open_inb_mbox == NULL)
+		goto out;
+
+	res = kmalloc(sizeof(struct resource), GFP_KERNEL);
 
 	if (res) {
 		rio_init_mbox_res(res, mbox, mbox);
@@ -88,7 +94,7 @@ int rio_request_inb_mbox(struct rio_mport *mport,
 		/* Hook the inbound message callback */
 		mport->inb_msg[mbox].mcback = minb;
 
-		rc = rio_open_inb_mbox(mport, dev_id, mbox, entries);
+		rc = mport->ops->open_inb_mbox(mport, dev_id, mbox, entries);
 	} else
 		rc = -ENOMEM;
 
@@ -106,10 +112,13 @@ int rio_request_inb_mbox(struct rio_mport *mport,
  */
 int rio_release_inb_mbox(struct rio_mport *mport, int mbox)
 {
-	rio_close_inb_mbox(mport, mbox);
+	if (mport->ops->close_inb_mbox) {
+		mport->ops->close_inb_mbox(mport, mbox);
 
-	/* Release the mailbox resource */
-	return release_resource(mport->inb_msg[mbox].res);
+		/* Release the mailbox resource */
+		return release_resource(mport->inb_msg[mbox].res);
+	} else
+		return -ENOSYS;
 }
 
 /**
@@ -129,9 +138,13 @@ int rio_request_outb_mbox(struct rio_mport *mport,
 			  int entries,
 			  void (*moutb) (struct rio_mport * mport, void *dev_id, int mbox, int slot))
 {
-	int rc = 0;
+	int rc = -ENOSYS;
+	struct resource *res;
 
-	struct resource *res = kmalloc(sizeof(struct resource), GFP_KERNEL);
+	if (mport->ops->open_outb_mbox == NULL)
+		goto out;
+
+	res = kmalloc(sizeof(struct resource), GFP_KERNEL);
 
 	if (res) {
 		rio_init_mbox_res(res, mbox, mbox);
@@ -149,7 +162,7 @@ int rio_request_outb_mbox(struct rio_mport *mport,
 		/* Hook the inbound message callback */
 		mport->outb_msg[mbox].mcback = moutb;
 
-		rc = rio_open_outb_mbox(mport, dev_id, mbox, entries);
+		rc = mport->ops->open_outb_mbox(mport, dev_id, mbox, entries);
 	} else
 		rc = -ENOMEM;
 
@@ -167,10 +180,13 @@ int rio_request_outb_mbox(struct rio_mport *mport,
  */
 int rio_release_outb_mbox(struct rio_mport *mport, int mbox)
 {
-	rio_close_outb_mbox(mport, mbox);
+	if (mport->ops->close_outb_mbox) {
+		mport->ops->close_outb_mbox(mport, mbox);
 
-	/* Release the mailbox resource */
-	return release_resource(mport->outb_msg[mbox].res);
+		/* Release the mailbox resource */
+		return release_resource(mport->outb_msg[mbox].res);
+	} else
+		return -ENOSYS;
 }
 
 /**
@@ -381,6 +397,49 @@ int rio_release_inb_pwrite(struct rio_dev *rdev)
 	return rc;
 }
 EXPORT_SYMBOL_GPL(rio_release_inb_pwrite);
+
+/**
+ * rio_map_inb_region -- Map inbound memory region.
+ * @mport: Master port.
+ * @local: physical address of memory region to be mapped
+ * @rbase: RIO base address assigned to this window
+ * @size: Size of the memory region
+ * @rflags: Flags for mapping.
+ *
+ * Return: 0 -- Success.
+ *
+ * This function will create the mapping from RIO space to local memory.
+ */
+int rio_map_inb_region(struct rio_mport *mport, dma_addr_t local,
+			u64 rbase, u32 size, u32 rflags)
+{
+	int rc = 0;
+	unsigned long flags;
+
+	if (!mport->ops->map_inb)
+		return -1;
+	spin_lock_irqsave(&rio_mmap_lock, flags);
+	rc = mport->ops->map_inb(mport, local, rbase, size, rflags);
+	spin_unlock_irqrestore(&rio_mmap_lock, flags);
+	return rc;
+}
+EXPORT_SYMBOL_GPL(rio_map_inb_region);
+
+/**
+ * rio_unmap_inb_region -- Unmap the inbound memory region
+ * @mport: Master port
+ * @lstart: physical address of memory region to be unmapped
+ */
+void rio_unmap_inb_region(struct rio_mport *mport, dma_addr_t lstart)
+{
+	unsigned long flags;
+	if (!mport->ops->unmap_inb)
+		return;
+	spin_lock_irqsave(&rio_mmap_lock, flags);
+	mport->ops->unmap_inb(mport, lstart);
+	spin_unlock_irqrestore(&rio_mmap_lock, flags);
+}
+EXPORT_SYMBOL_GPL(rio_unmap_inb_region);
 
 /**
  * rio_mport_get_physefb - Helper function that returns register offset
@@ -1106,11 +1165,92 @@ int rio_std_route_clr_table(struct rio_mport *mport, u16 destid, u8 hopcount,
 	return 0;
 }
 
+#ifdef CONFIG_RAPIDIO_DMA_ENGINE
+
+static bool rio_chan_filter(struct dma_chan *chan, void *arg)
+{
+	struct rio_dev *rdev = arg;
+
+	/* Check that DMA device belongs to the right MPORT */
+	return (rdev->net->hport ==
+		container_of(chan->device, struct rio_mport, dma));
+}
+
+/**
+ * rio_request_dma - request RapidIO capable DMA channel that supports
+ *   specified target RapidIO device.
+ * @rdev: RIO device control structure
+ *
+ * Returns pointer to allocated DMA channel or NULL if failed.
+ */
+struct dma_chan *rio_request_dma(struct rio_dev *rdev)
+{
+	dma_cap_mask_t mask;
+	struct dma_chan *dchan;
+
+	dma_cap_zero(mask);
+	dma_cap_set(DMA_SLAVE, mask);
+	dchan = dma_request_channel(mask, rio_chan_filter, rdev);
+
+	return dchan;
+}
+EXPORT_SYMBOL_GPL(rio_request_dma);
+
+/**
+ * rio_release_dma - release specified DMA channel
+ * @dchan: DMA channel to release
+ */
+void rio_release_dma(struct dma_chan *dchan)
+{
+	dma_release_channel(dchan);
+}
+EXPORT_SYMBOL_GPL(rio_release_dma);
+
+/**
+ * rio_dma_prep_slave_sg - RapidIO specific wrapper
+ *   for device_prep_slave_sg callback defined by DMAENGINE.
+ * @rdev: RIO device control structure
+ * @dchan: DMA channel to configure
+ * @data: RIO specific data descriptor
+ * @direction: DMA data transfer direction (TO or FROM the device)
+ * @flags: dmaengine defined flags
+ *
+ * Initializes RapidIO capable DMA channel for the specified data transfer.
+ * Uses DMA channel private extension to pass information related to remote
+ * target RIO device.
+ * Returns pointer to DMA transaction descriptor or NULL if failed.
+ */
+struct dma_async_tx_descriptor *rio_dma_prep_slave_sg(struct rio_dev *rdev,
+	struct dma_chan *dchan, struct rio_dma_data *data,
+	enum dma_transfer_direction direction, unsigned long flags)
+{
+	struct dma_async_tx_descriptor *txd = NULL;
+	struct rio_dma_ext rio_ext;
+
+	if (dchan->device->device_prep_slave_sg == NULL) {
+		pr_err("%s: prep_rio_sg == NULL\n", __func__);
+		return NULL;
+	}
+
+	rio_ext.destid = rdev->destid;
+	rio_ext.rio_addr_u = data->rio_addr_u;
+	rio_ext.rio_addr = data->rio_addr;
+	rio_ext.wr_type = data->wr_type;
+
+	txd = dmaengine_prep_rio_sg(dchan, data->sg, data->sg_len,
+					direction, flags, &rio_ext);
+
+	return txd;
+}
+EXPORT_SYMBOL_GPL(rio_dma_prep_slave_sg);
+
+#endif /* CONFIG_RAPIDIO_DMA_ENGINE */
+
 static void rio_fixup_device(struct rio_dev *dev)
 {
 }
 
-static int __devinit rio_init(void)
+static int rio_init(void)
 {
 	struct rio_dev *dev = NULL;
 
@@ -1120,37 +1260,119 @@ static int __devinit rio_init(void)
 	return 0;
 }
 
-device_initcall(rio_init);
+static struct workqueue_struct *rio_wq;
 
-int __devinit rio_init_mports(void)
+struct rio_disc_work {
+	struct work_struct	work;
+	struct rio_mport	*mport;
+};
+
+static void disc_work_handler(struct work_struct *_work)
 {
-	int rc = 0;
+	struct rio_disc_work *work;
+
+	work = container_of(_work, struct rio_disc_work, work);
+	pr_debug("RIO: discovery work for mport %d %s\n",
+		 work->mport->id, work->mport->name);
+	rio_disc_mport(work->mport);
+}
+
+int rio_init_mports(void)
+{
 	struct rio_mport *port;
+	struct rio_disc_work *work;
+	int n = 0;
 
+	if (!next_portid)
+		return -ENODEV;
+
+	/*
+	 * First, run enumerations and check if we need to perform discovery
+	 * on any of the registered mports.
+	 */
 	list_for_each_entry(port, &rio_mports, node) {
-		if (!request_mem_region(port->iores.start,
-					resource_size(&port->iores),
-					port->name)) {
-			printk(KERN_ERR
-			       "RIO: Error requesting master port region 0x%016llx-0x%016llx\n",
-			       (u64)port->iores.start, (u64)port->iores.end);
-			rc = -ENOMEM;
-			goto out;
-		}
-
 		if (port->host_deviceid >= 0)
 			rio_enum_mport(port);
 		else
-			rio_disc_mport(port);
+			n++;
 	}
 
-      out:
-	return rc;
+	if (!n)
+		goto no_disc;
+
+	/*
+	 * If we have mports that require discovery schedule a discovery work
+	 * for each of them. If the code below fails to allocate needed
+	 * resources, exit without error to keep results of enumeration
+	 * process (if any).
+	 * TODO: Implement restart of dicovery process for all or
+	 * individual discovering mports.
+	 */
+	rio_wq = alloc_workqueue("riodisc", 0, 0);
+	if (!rio_wq) {
+		pr_err("RIO: unable allocate rio_wq\n");
+		goto no_disc;
+	}
+
+	work = kcalloc(n, sizeof *work, GFP_KERNEL);
+	if (!work) {
+		pr_err("RIO: no memory for work struct\n");
+		destroy_workqueue(rio_wq);
+		goto no_disc;
+	}
+
+	n = 0;
+	list_for_each_entry(port, &rio_mports, node) {
+		if (port->host_deviceid < 0) {
+			work[n].mport = port;
+			INIT_WORK(&work[n].work, disc_work_handler);
+			queue_work(rio_wq, &work[n].work);
+			n++;
+		}
+	}
+
+	flush_workqueue(rio_wq);
+	pr_debug("RIO: destroy discovery workqueue\n");
+	destroy_workqueue(rio_wq);
+	kfree(work);
+
+no_disc:
+	rio_init();
+
+	return 0;
 }
 
-void rio_register_mport(struct rio_mport *port)
+device_initcall_sync(rio_init_mports);
+
+static int hdids[RIO_MAX_MPORTS + 1];
+
+static int rio_get_hdid(int index)
 {
+	if (!hdids[0] || hdids[0] <= index || index >= RIO_MAX_MPORTS)
+		return -1;
+
+	return hdids[index + 1];
+}
+
+static int rio_hdid_setup(char *str)
+{
+	(void)get_options(str, ARRAY_SIZE(hdids), hdids);
+	return 1;
+}
+
+__setup("riohdid=", rio_hdid_setup);
+
+int rio_register_mport(struct rio_mport *port)
+{
+	if (next_portid >= RIO_MAX_MPORTS) {
+		pr_err("RIO: reached specified max number of mports\n");
+		return 1;
+	}
+
+	port->id = next_portid++;
+	port->host_deviceid = rio_get_hdid(port->id);
 	list_add_tail(&port->node, &rio_mports);
+	return 0;
 }
 
 EXPORT_SYMBOL_GPL(rio_local_get_device_id);

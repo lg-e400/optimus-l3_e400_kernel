@@ -114,7 +114,8 @@ int sctp_tsnmap_check(const struct sctp_tsnmap *map, __u32 tsn)
 
 
 /* Mark this TSN as seen.  */
-int sctp_tsnmap_mark(struct sctp_tsnmap *map, __u32 tsn)
+int sctp_tsnmap_mark(struct sctp_tsnmap *map, __u32 tsn,
+		     struct sctp_transport *trans)
 {
 	u16 gap;
 
@@ -133,6 +134,9 @@ int sctp_tsnmap_mark(struct sctp_tsnmap *map, __u32 tsn)
 		 */
 		map->max_tsn_seen++;
 		map->cumulative_tsn_ack_point++;
+		if (trans)
+			trans->sack_generation =
+				trans->asoc->peer.sack_generation;
 		map->base_tsn++;
 	} else {
 		/* Either we already have a gap, or about to record a gap, so
@@ -268,7 +272,7 @@ __u16 sctp_tsnmap_pending(struct sctp_tsnmap *map)
 	__u32 max_tsn = map->max_tsn_seen;
 	__u32 base_tsn = map->base_tsn;
 	__u16 pending_data;
-	u32 gap, i;
+	u32 gap;
 
 	pending_data = max_tsn - cum_tsn;
 	gap = max_tsn - base_tsn;
@@ -276,11 +280,7 @@ __u16 sctp_tsnmap_pending(struct sctp_tsnmap *map)
 	if (gap == 0 || gap >= map->len)
 		goto out;
 
-	for (i = 0; i < gap+1; i++) {
-		if (test_bit(i, map->tsn_map))
-			pending_data--;
-	}
-
+	pending_data -= bitmap_weight(map->tsn_map, gap + 1);
 out:
 	return pending_data;
 }
@@ -344,7 +344,7 @@ __u16 sctp_tsnmap_num_gabs(struct sctp_tsnmap *map,
 
 	/* Refresh the gap ack information. */
 	if (sctp_tsnmap_has_gap(map)) {
-		__u16 start, end;
+		__u16 start = 0, end = 0;
 		sctp_tsnmap_iter_init(map, &iter);
 		while (sctp_tsnmap_next_gap_ack(map, &iter,
 						&start,

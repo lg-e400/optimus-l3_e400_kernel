@@ -37,7 +37,6 @@
 #include <linux/scatterlist.h>
 #include <linux/crypto.h>
 #include <asm/io.h>
-#include <asm/system.h>
 #include <asm/unaligned.h>
 
 #include <linux/netdevice.h>
@@ -79,7 +78,7 @@ static struct pci_driver airo_driver = {
 	.name     = DRV_NAME,
 	.id_table = card_ids,
 	.probe    = airo_pci_probe,
-	.remove   = __devexit_p(airo_pci_remove),
+	.remove   = airo_pci_remove,
 	.suspend  = airo_pci_suspend,
 	.resume   = airo_pci_resume,
 };
@@ -88,7 +87,6 @@ static struct pci_driver airo_driver = {
 /* Include Wireless Extension definition and check version - Jean II */
 #include <linux/wireless.h>
 #define WIRELESS_SPY		/* enable iwspy support */
-#include <net/iw_handler.h>	/* New driver API */
 
 #define CISCO_EXT		/* enable Cisco extensions */
 #ifdef CISCO_EXT
@@ -233,8 +231,10 @@ static int adhoc;
 
 static int probe = 1;
 
+static kuid_t proc_kuid;
 static int proc_uid /* = 0 */;
 
+static kgid_t proc_kgid;
 static int proc_gid /* = 0 */;
 
 static int airo_perm = 0555;
@@ -242,9 +242,8 @@ static int airo_perm = 0555;
 static int proc_perm = 0644;
 
 MODULE_AUTHOR("Benjamin Reed");
-MODULE_DESCRIPTION("Support for Cisco/Aironet 802.11 wireless ethernet \
-cards.  Direct support for ISA/PCI/MPI cards and support \
-for PCMCIA when used with airo_cs.");
+MODULE_DESCRIPTION("Support for Cisco/Aironet 802.11 wireless ethernet cards.  "
+		   "Direct support for ISA/PCI/MPI cards and support for PCMCIA when used with airo_cs.");
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_SUPPORTED_DEVICE("Aironet 4500, 4800 and Cisco 340/350");
 module_param_array(io, int, NULL, 0);
@@ -252,18 +251,20 @@ module_param_array(irq, int, NULL, 0);
 module_param_array(rates, int, NULL, 0);
 module_param_array(ssids, charp, NULL, 0);
 module_param(auto_wep, int, 0);
-MODULE_PARM_DESC(auto_wep, "If non-zero, the driver will keep looping through \
-the authentication options until an association is made.  The value of \
-auto_wep is number of the wep keys to check.  A value of 2 will try using \
-the key at index 0 and index 1.");
+MODULE_PARM_DESC(auto_wep,
+		 "If non-zero, the driver will keep looping through the authentication options until an association is made.  "
+		 "The value of auto_wep is number of the wep keys to check.  "
+		 "A value of 2 will try using the key at index 0 and index 1.");
 module_param(aux_bap, int, 0);
-MODULE_PARM_DESC(aux_bap, "If non-zero, the driver will switch into a mode \
-than seems to work better for older cards with some older buses.  Before \
-switching it checks that the switch is needed.");
+MODULE_PARM_DESC(aux_bap,
+		 "If non-zero, the driver will switch into a mode that seems to work better for older cards with some older buses.  "
+		 "Before switching it checks that the switch is needed.");
 module_param(maxencrypt, int, 0);
-MODULE_PARM_DESC(maxencrypt, "The maximum speed that the card can do \
-encryption.  Units are in 512kbs.  Zero (default) means there is no limit. \
-Older cards used to be limited to 2mbs (4).");
+MODULE_PARM_DESC(maxencrypt,
+		 "The maximum speed that the card can do encryption.  "
+		 "Units are in 512kbs.  "
+		 "Zero (default) means there is no limit.  "
+		 "Older cards used to be limited to 2mbs (4).");
 module_param(adhoc, int, 0);
 MODULE_PARM_DESC(adhoc, "If non-zero, the card will start in adhoc mode.");
 module_param(probe, int, 0);
@@ -1417,7 +1418,7 @@ static int encapsulate(struct airo_info *ai ,etherHead *frame, MICBuffer *mic, i
 	emmh32_update(&context->seed,frame->da,ETH_ALEN * 2); // DA,SA
 	emmh32_update(&context->seed,(u8*)&mic->typelen,10); // Type/Length and Snap
 	emmh32_update(&context->seed,(u8*)&mic->seq,sizeof(mic->seq)); //SEQ
-	emmh32_update(&context->seed,frame->da + ETH_ALEN * 2,payLen); //payload
+	emmh32_update(&context->seed,(u8*)(frame + 1),payLen); //payload
 	emmh32_final(&context->seed, (u8*)&mic->mic);
 
 	/*    New Type/length ?????????? */
@@ -1505,7 +1506,7 @@ static int decapsulate(struct airo_info *ai, MICBuffer *mic, etherHead *eth, u16
 		emmh32_update(&context->seed, eth->da, ETH_ALEN*2); 
 		emmh32_update(&context->seed, (u8 *)&mic->typelen, sizeof(mic->typelen)+sizeof(mic->u.snap)); 
 		emmh32_update(&context->seed, (u8 *)&mic->seq,sizeof(mic->seq));	
-		emmh32_update(&context->seed, eth->da + ETH_ALEN*2,payLen);	
+		emmh32_update(&context->seed, (u8 *)(eth + 1),payLen);	
 		//Calculate MIC
 		emmh32_final(&context->seed, digest);
 	
@@ -1868,7 +1869,7 @@ static int readStatsRid(struct airo_info*ai, StatsRid *sr, int rid, int lock)
 
 static void try_auto_wep(struct airo_info *ai)
 {
-	if (auto_wep && !(ai->flags & FLAG_RADIO_DOWN)) {
+	if (auto_wep && !test_bit(FLAG_RADIO_DOWN, &ai->flags)) {
 		ai->expires = RUN_AT(3*HZ);
 		wake_up_interruptible(&ai->thr_wait);
 	}
@@ -1884,7 +1885,7 @@ static int airo_open(struct net_device *dev) {
 	/* Make sure the card is configured.
 	 * Wireless Extensions may postpone config changes until the card
 	 * is open (to pipeline changes and speed-up card setup). If
-	 * those changes are not yet commited, do it now - Jean II */
+	 * those changes are not yet committed, do it now - Jean II */
 	if (test_bit(FLAG_COMMIT, &ai->flags)) {
 		disable_MAC(ai, 1);
 		writeConfigRid(ai, 1);
@@ -1992,12 +1993,12 @@ static int mpi_send_packet (struct net_device *dev)
 /*
  * Magic, the cards firmware needs a length count (2 bytes) in the host buffer
  * right after  TXFID_HDR.The TXFID_HDR contains the status short so payloadlen
- * is immediatly after it. ------------------------------------------------
+ * is immediately after it. ------------------------------------------------
  *                         |TXFIDHDR+STATUS|PAYLOADLEN|802.3HDR|PACKETDATA|
  *                         ------------------------------------------------
  */
 
-	memcpy((char *)ai->txfids[0].virtual_host_addr,
+	memcpy(ai->txfids[0].virtual_host_addr,
 		(char *)&wifictlhdr8023, sizeof(wifictlhdr8023));
 
 	payloadLen = (__le16 *)(ai->txfids[0].virtual_host_addr +
@@ -2006,7 +2007,7 @@ static int mpi_send_packet (struct net_device *dev)
 		sizeof(wifictlhdr8023) + 2 ;
 
 	/*
-	 * Firmware automaticly puts 802 header on so
+	 * Firmware automatically puts 802 header on so
 	 * we don't need to account for it in the length
 	 */
 	if (test_bit(FLAG_MIC_CAPABLE, &ai->flags) && ai->micstats.enabled &&
@@ -2531,7 +2532,7 @@ static int mpi_init_descriptors (struct airo_info *ai)
 /*
  * We are setting up three things here:
  * 1) Map AUX memory for descriptors: Rid, TxFid, or RxFid.
- * 2) Map PCI memory for issueing commands.
+ * 2) Map PCI memory for issuing commands.
  * 3) Allocate memory (shared) to send and receive ethernet frames.
  */
 static int mpi_map_card(struct airo_info *ai, struct pci_dev *pci)
@@ -2753,7 +2754,7 @@ static const struct net_device_ops airo_netdev_ops = {
 	.ndo_stop		= airo_close,
 	.ndo_start_xmit		= airo_start_xmit,
 	.ndo_get_stats		= airo_get_stats,
-	.ndo_set_multicast_list	= airo_set_multicast_list,
+	.ndo_set_rx_mode	= airo_set_multicast_list,
 	.ndo_set_mac_address	= airo_set_mac_address,
 	.ndo_do_ioctl		= airo_ioctl,
 	.ndo_change_mtu		= airo_change_mtu,
@@ -2765,7 +2766,7 @@ static const struct net_device_ops mpi_netdev_ops = {
 	.ndo_stop		= airo_close,
 	.ndo_start_xmit		= mpi_start_xmit,
 	.ndo_get_stats		= airo_get_stats,
-	.ndo_set_multicast_list	= airo_set_multicast_list,
+	.ndo_set_rx_mode	= airo_set_multicast_list,
 	.ndo_set_mac_address	= airo_set_mac_address,
 	.ndo_do_ioctl		= airo_ioctl,
 	.ndo_change_mtu		= airo_change_mtu,
@@ -2822,6 +2823,7 @@ static struct net_device *_init_airo_card( unsigned short irq, int port,
 	dev->wireless_data = &ai->wireless_data;
 	dev->irq = irq;
 	dev->base_addr = port;
+	dev->priv_flags &= ~IFF_TX_SKB_SHARING;
 
 	SET_NETDEV_DEV(dev, dmdev);
 
@@ -3947,7 +3949,7 @@ static u16 issuecommand(struct airo_info *ai, Cmd *pCmd, Resp *pRsp) {
 
 	if ( max_tries == -1 ) {
 		airo_print_err(ai->dev->name,
-			"Max tries exceeded when issueing command");
+			"Max tries exceeded when issuing command");
 		if (IN4500(ai, COMMAND) & COMMAND_BUSY)
 			OUT4500(ai, EVACK, EV_CLEARCOMMANDBUSY);
 		return ERROR;
@@ -4173,7 +4175,7 @@ done:
 }
 
 /*  Note, that we are using BAP1 which is also used by transmit, so
- *  make sure this isnt called when a transmit is happening */
+ *  make sure this isn't called when a transmit is happening */
 static int PC4500_writerid(struct airo_info *ai, u16 rid,
 			   const void *pBuf, int len, int lock)
 {
@@ -4211,7 +4213,7 @@ static int PC4500_writerid(struct airo_info *ai, u16 rid,
 			airo_print_err(ai->dev->name, "%s: len=%d", __func__, len);
 			rc = -1;
 		} else {
-			memcpy((char *)ai->config_desc.virtual_host_addr,
+			memcpy(ai->config_desc.virtual_host_addr,
 				pBuf, len);
 
 			rc = issuecommand(ai, &cmd, &rsp);
@@ -4498,87 +4500,79 @@ struct proc_data {
 static int setup_proc_entry( struct net_device *dev,
 			     struct airo_info *apriv ) {
 	struct proc_dir_entry *entry;
+
 	/* First setup the device directory */
 	strcpy(apriv->proc_name,dev->name);
-	apriv->proc_entry = create_proc_entry(apriv->proc_name,
-					      S_IFDIR|airo_perm,
-					      airo_entry);
+	apriv->proc_entry = proc_mkdir_mode(apriv->proc_name, airo_perm,
+					    airo_entry);
 	if (!apriv->proc_entry)
 		goto fail;
-	apriv->proc_entry->uid = proc_uid;
-	apriv->proc_entry->gid = proc_gid;
+	apriv->proc_entry->uid = proc_kuid;
+	apriv->proc_entry->gid = proc_kgid;
 
 	/* Setup the StatsDelta */
-	entry = proc_create_data("StatsDelta",
-				 S_IFREG | (S_IRUGO&proc_perm),
+	entry = proc_create_data("StatsDelta", S_IRUGO & proc_perm,
 				 apriv->proc_entry, &proc_statsdelta_ops, dev);
 	if (!entry)
 		goto fail_stats_delta;
-	entry->uid = proc_uid;
-	entry->gid = proc_gid;
+	entry->uid = proc_kuid;
+	entry->gid = proc_kgid;
 
 	/* Setup the Stats */
-	entry = proc_create_data("Stats",
-				 S_IFREG | (S_IRUGO&proc_perm),
+	entry = proc_create_data("Stats", S_IRUGO & proc_perm,
 				 apriv->proc_entry, &proc_stats_ops, dev);
 	if (!entry)
 		goto fail_stats;
-	entry->uid = proc_uid;
-	entry->gid = proc_gid;
+	entry->uid = proc_kuid;
+	entry->gid = proc_kgid;
 
 	/* Setup the Status */
-	entry = proc_create_data("Status",
-				 S_IFREG | (S_IRUGO&proc_perm),
+	entry = proc_create_data("Status", S_IRUGO & proc_perm,
 				 apriv->proc_entry, &proc_status_ops, dev);
 	if (!entry)
 		goto fail_status;
-	entry->uid = proc_uid;
-	entry->gid = proc_gid;
+	entry->uid = proc_kuid;
+	entry->gid = proc_kgid;
 
 	/* Setup the Config */
-	entry = proc_create_data("Config",
-				 S_IFREG | proc_perm,
+	entry = proc_create_data("Config", proc_perm,
 				 apriv->proc_entry, &proc_config_ops, dev);
 	if (!entry)
 		goto fail_config;
-	entry->uid = proc_uid;
-	entry->gid = proc_gid;
+	entry->uid = proc_kuid;
+	entry->gid = proc_kgid;
 
 	/* Setup the SSID */
-	entry = proc_create_data("SSID",
-				 S_IFREG | proc_perm,
+	entry = proc_create_data("SSID", proc_perm,
 				 apriv->proc_entry, &proc_SSID_ops, dev);
 	if (!entry)
 		goto fail_ssid;
-	entry->uid = proc_uid;
-	entry->gid = proc_gid;
+	entry->uid = proc_kuid;
+	entry->gid = proc_kgid;
 
 	/* Setup the APList */
-	entry = proc_create_data("APList",
-				 S_IFREG | proc_perm,
+	entry = proc_create_data("APList", proc_perm,
 				 apriv->proc_entry, &proc_APList_ops, dev);
 	if (!entry)
 		goto fail_aplist;
-	entry->uid = proc_uid;
-	entry->gid = proc_gid;
+	entry->uid = proc_kuid;
+	entry->gid = proc_kgid;
 
 	/* Setup the BSSList */
-	entry = proc_create_data("BSSList",
-				 S_IFREG | proc_perm,
+	entry = proc_create_data("BSSList", proc_perm,
 				 apriv->proc_entry, &proc_BSSList_ops, dev);
 	if (!entry)
 		goto fail_bsslist;
-	entry->uid = proc_uid;
-	entry->gid = proc_gid;
+	entry->uid = proc_kuid;
+	entry->gid = proc_kgid;
 
 	/* Setup the WepKey */
-	entry = proc_create_data("WepKey",
-				 S_IFREG | proc_perm,
+	entry = proc_create_data("WepKey", proc_perm,
 				 apriv->proc_entry, &proc_wepkey_ops, dev);
 	if (!entry)
 		goto fail_wepkey;
-	entry->uid = proc_uid;
-	entry->gid = proc_gid;
+	entry->uid = proc_kuid;
+	entry->gid = proc_kgid;
 
 	return 0;
 
@@ -4776,7 +4770,7 @@ static int proc_stats_rid_open( struct inode *inode,
 		if (!statsLabels[i]) continue;
 		if (j+strlen(statsLabels[i])+16>4096) {
 			airo_print_warn(apriv->dev->name,
-			       "Potentially disasterous buffer overflow averted!");
+			       "Potentially disastrous buffer overflow averted!");
 			break;
 		}
 		j+=sprintf(data->rbuffer+j, "%s: %u\n", statsLabels[i],
@@ -5590,7 +5584,7 @@ static void timer_func( struct net_device *dev ) {
 }
 
 #ifdef CONFIG_PCI
-static int __devinit airo_pci_probe(struct pci_dev *pdev,
+static int airo_pci_probe(struct pci_dev *pdev,
 				    const struct pci_device_id *pent)
 {
 	struct net_device *dev;
@@ -5612,7 +5606,7 @@ static int __devinit airo_pci_probe(struct pci_dev *pdev,
 	return 0;
 }
 
-static void __devexit airo_pci_remove(struct pci_dev *pdev)
+static void airo_pci_remove(struct pci_dev *pdev)
 {
 	struct net_device *dev = pci_get_drvdata(pdev);
 
@@ -5705,13 +5699,16 @@ static int __init airo_init_module( void )
 {
 	int i;
 
-	airo_entry = create_proc_entry("driver/aironet",
-				       S_IFDIR | airo_perm,
-				       NULL);
+	proc_kuid = make_kuid(&init_user_ns, proc_uid);
+	proc_kgid = make_kgid(&init_user_ns, proc_gid);
+	if (!uid_valid(proc_kuid) || !gid_valid(proc_kgid))
+		return -EINVAL;
+
+	airo_entry = proc_mkdir_mode("driver/aironet", airo_perm, NULL);
 
 	if (airo_entry) {
-		airo_entry->uid = proc_uid;
-		airo_entry->gid = proc_gid;
+		airo_entry->uid = proc_kuid;
+		airo_entry->gid = proc_kgid;
 	}
 
 	for (i = 0; i < 4 && io[i] && irq[i]; i++) {
@@ -5986,13 +5983,11 @@ static int airo_set_wap(struct net_device *dev,
 	Cmd cmd;
 	Resp rsp;
 	APListRid APList_rid;
-	static const u8 any[ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-	static const u8 off[ETH_ALEN] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 
 	if (awrq->sa_family != ARPHRD_ETHER)
 		return -EINVAL;
-	else if (!memcmp(any, awrq->sa_data, ETH_ALEN) ||
-	         !memcmp(off, awrq->sa_data, ETH_ALEN)) {
+	else if (is_broadcast_ether_addr(awrq->sa_data) ||
+		 is_zero_ether_addr(awrq->sa_data)) {
 		memset(&cmd, 0, sizeof(cmd));
 		cmd.cmd=CMD_LOSE_SYNC;
 		if (down_interruptible(&local->sem))
@@ -7243,8 +7238,8 @@ static int airo_get_aplist(struct net_device *dev,
 		}
 	} else {
 		dwrq->flags = 1; /* Should be define'd */
-		memcpy(extra + sizeof(struct sockaddr)*i,
-		       &qual,  sizeof(struct iw_quality)*i);
+		memcpy(extra + sizeof(struct sockaddr) * i, qual,
+		       sizeof(struct iw_quality) * i);
 	}
 	dwrq->length = i;
 
@@ -7438,7 +7433,7 @@ static inline char *airo_translate_scan(struct net_device *dev,
 					num_null_ies++;
 				break;
 
-			case WLAN_EID_GENERIC:
+			case WLAN_EID_VENDOR_SPECIFIC:
 				if (ie[1] >= 4 &&
 				    ie[2] == 0x00 &&
 				    ie[3] == 0x50 &&

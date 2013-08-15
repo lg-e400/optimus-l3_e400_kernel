@@ -46,7 +46,6 @@
 
 #define PREFIX "ACPI: "
 
-#define ACPI_VIDEO_CLASS		"video"
 #define ACPI_VIDEO_BUS_NAME		"Video Bus"
 #define ACPI_VIDEO_DEVICE_NAME		"Video Device"
 #define ACPI_VIDEO_NOTIFY_SWITCH	0x80
@@ -70,21 +69,21 @@ MODULE_AUTHOR("Bruno Ducrot");
 MODULE_DESCRIPTION("ACPI Video Driver");
 MODULE_LICENSE("GPL");
 
-static int brightness_switch_enabled = 1;
+static bool brightness_switch_enabled = 1;
 module_param(brightness_switch_enabled, bool, 0644);
 
 /*
  * By default, we don't allow duplicate ACPI video bus devices
  * under the same VGA controller
  */
-static int allow_duplicates;
+static bool allow_duplicates;
 module_param(allow_duplicates, bool, 0644);
 
 /*
  * Some BIOSes claim they use minimum backlight at boot,
  * and this may bring dimming screen after boot
  */
-static int use_bios_initial_backlight = 1;
+static bool use_bios_initial_backlight = 1;
 module_param(use_bios_initial_backlight, bool, 0644);
 
 static int register_count = 0;
@@ -308,7 +307,7 @@ video_set_cur_state(struct thermal_cooling_device *cooling_dev, unsigned long st
 	return acpi_video_device_lcd_set_level(video, level);
 }
 
-static struct thermal_cooling_device_ops video_cooling_ops = {
+static const struct thermal_cooling_device_ops video_cooling_ops = {
 	.get_max_state = video_get_max_state,
 	.get_cur_state = video_get_cur_state,
 	.set_cur_state = video_set_cur_state,
@@ -390,6 +389,12 @@ static int __init video_set_bqc_offset(const struct dmi_system_id *d)
 	return 0;
 }
 
+static int video_ignore_initial_backlight(const struct dmi_system_id *d)
+{
+	use_bios_initial_backlight = 0;
+	return 0;
+}
+
 static struct dmi_system_id video_dmi_table[] __initdata = {
 	/*
 	 * Broken _BQC workaround http://bugzilla.kernel.org/show_bug.cgi?id=13121
@@ -432,6 +437,14 @@ static struct dmi_system_id video_dmi_table[] __initdata = {
 	 .matches = {
 		DMI_MATCH(DMI_BOARD_VENDOR, "Acer"),
 		DMI_MATCH(DMI_PRODUCT_NAME, "Aspire 7720"),
+		},
+	},
+	{
+	 .callback = video_ignore_initial_backlight,
+	 .ident = "HP Folio 13-2000",
+	 .matches = {
+		DMI_MATCH(DMI_BOARD_VENDOR, "Hewlett-Packard"),
+		DMI_MATCH(DMI_PRODUCT_NAME, "HP Folio 13 - 2000 Notebook PC"),
 		},
 	},
 	{}
@@ -549,27 +562,29 @@ acpi_video_device_EDID(struct acpi_video_device *device,
  *		1. 	The system BIOS should NOT automatically control the brightness 
  *			level of the LCD when the power changes from AC to DC.
  * Return Value:
- * 		-1	wrong arg.
+ *		-EINVAL	wrong arg.
  */
 
 static int
 acpi_video_bus_DOS(struct acpi_video_bus *video, int bios_flag, int lcd_flag)
 {
-	u64 status = 0;
+	acpi_status status;
 	union acpi_object arg0 = { ACPI_TYPE_INTEGER };
 	struct acpi_object_list args = { 1, &arg0 };
 
+	if (!video->cap._DOS)
+		return 0;
 
-	if (bios_flag < 0 || bios_flag > 3 || lcd_flag < 0 || lcd_flag > 1) {
-		status = -1;
-		goto Failed;
-	}
+	if (bios_flag < 0 || bios_flag > 3 || lcd_flag < 0 || lcd_flag > 1)
+		return -EINVAL;
 	arg0.integer.value = (lcd_flag << 2) | bios_flag;
 	video->dos_setting = arg0.integer.value;
-	acpi_evaluate_object(video->device->handle, "_DOS", &args, NULL);
+	status = acpi_evaluate_object(video->device->handle, "_DOS",
+		&args, NULL);
+	if (ACPI_FAILURE(status))
+		return -EIO;
 
-      Failed:
-	return status;
+	return 0;
 }
 
 /*
@@ -782,6 +797,9 @@ static void acpi_video_device_find_cap(struct acpi_video_device *device)
 
 	if (acpi_video_backlight_support()) {
 		struct backlight_properties props;
+		struct pci_dev *pdev;
+		acpi_handle acpi_parent;
+		struct device *parent = NULL;
 		int result;
 		static int count = 0;
 		char *name;
@@ -794,9 +812,20 @@ static void acpi_video_device_find_cap(struct acpi_video_device *device)
 			return;
 		count++;
 
+		acpi_get_parent(device->dev->handle, &acpi_parent);
+
+		pdev = acpi_get_pci_dev(acpi_parent);
+		if (pdev) {
+			parent = &pdev->dev;
+			pci_dev_put(pdev);
+		}
+
 		memset(&props, 0, sizeof(struct backlight_properties));
+		props.type = BACKLIGHT_FIRMWARE;
 		props.max_brightness = device->brightness->count - 3;
-		device->backlight = backlight_device_register(name, NULL, device,
+		device->backlight = backlight_device_register(name,
+							      parent,
+							      device,
 							      &acpi_backlight_ops,
 							      &props);
 		kfree(name);
@@ -809,11 +838,6 @@ static void acpi_video_device_find_cap(struct acpi_video_device *device)
 		 */
 		device->backlight->props.brightness =
 				acpi_video_get_brightness(device->backlight);
-
-		result = sysfs_create_link(&device->backlight->dev.kobj,
-					   &device->dev->dev.kobj, "device");
-		if (result)
-			printk(KERN_ERR PREFIX "Create sysfs link\n");
 
 		device->cooling_dev = thermal_cooling_device_register("LCD",
 					device->dev, &video_cooling_ops);
@@ -1338,14 +1362,19 @@ acpi_video_bus_get_devices(struct acpi_video_bus *video,
 	int status = 0;
 	struct acpi_device *dev;
 
+	/*
+	 * There are systems where video module known to work fine regardless
+	 * of broken _DOD and ignoring returned value here doesn't cause
+	 * any issues later.
+	 */
 	acpi_video_device_enumerate(video);
 
 	list_for_each_entry(dev, &device->children, node) {
 
 		status = acpi_video_bus_get_one_device(dev, video);
-		if (ACPI_FAILURE(status)) {
+		if (status) {
 			printk(KERN_WARNING PREFIX
-					"Cant attach device\n");
+					"Can't attach device\n");
 			continue;
 		}
 	}
@@ -1364,10 +1393,9 @@ static int acpi_video_bus_put_one_device(struct acpi_video_device *device)
 					    acpi_video_device_notify);
 	if (ACPI_FAILURE(status)) {
 		printk(KERN_WARNING PREFIX
-		       "Cant remove video notify handler\n");
+		       "Can't remove video notify handler\n");
 	}
 	if (device->backlight) {
-		sysfs_remove_link(&device->backlight->dev.kobj, "device");
 		backlight_device_unregister(device->backlight);
 		device->backlight = NULL;
 	}
@@ -1467,7 +1495,9 @@ static void acpi_video_bus_notify(struct acpi_device *device, u32 event)
 		break;
 	}
 
-	acpi_notifier_call_chain(device, event, 0);
+	if (acpi_notifier_call_chain(device, event, 0))
+		/* Something vetoed the keypress. */
+		keycode = 0;
 
 	if (keycode) {
 		input_report_key(input, keycode, 1);
@@ -1513,7 +1543,7 @@ static void acpi_video_device_notify(acpi_handle handle, u32 event, void *data)
 		acpi_bus_generate_proc_event(device, event, 0);
 		keycode = KEY_BRIGHTNESSDOWN;
 		break;
-	case ACPI_VIDEO_NOTIFY_ZERO_BRIGHTNESS:	/* zero brightnesss */
+	case ACPI_VIDEO_NOTIFY_ZERO_BRIGHTNESS:	/* zero brightness */
 		if (brightness_switch_enabled)
 			acpi_video_switch_brightness(video_device, event);
 		acpi_bus_generate_proc_event(device, event, 0);
@@ -1644,14 +1674,19 @@ static int acpi_video_bus_add(struct acpi_device *device)
 	mutex_init(&video->device_list_lock);
 	INIT_LIST_HEAD(&video->video_device_list);
 
-	acpi_video_bus_get_devices(video, device);
-	acpi_video_bus_start_devices(video);
+	error = acpi_video_bus_get_devices(video, device);
+	if (error)
+		goto err_free_video;
 
 	video->input = input = input_allocate_device();
 	if (!input) {
 		error = -ENOMEM;
-		goto err_stop_video;
+		goto err_put_video;
 	}
+
+	error = acpi_video_bus_start_devices(video);
+	if (error)
+		goto err_free_input_dev;
 
 	snprintf(video->phys, sizeof(video->phys),
 		"%s/video/input0", acpi_device_hid(video->device));
@@ -1671,10 +1706,6 @@ static int acpi_video_bus_add(struct acpi_device *device)
 	set_bit(KEY_BRIGHTNESS_ZERO, input->keybit);
 	set_bit(KEY_DISPLAY_OFF, input->keybit);
 
-	error = input_register_device(input);
-	if (error)
-		goto err_free_input_dev;
-
 	printk(KERN_INFO PREFIX "%s [%s] (multi-head: %s  rom: %s  post: %s)\n",
 	       ACPI_VIDEO_DEVICE_NAME, acpi_device_bid(device),
 	       video->flags.multihead ? "yes" : "no",
@@ -1683,14 +1714,23 @@ static int acpi_video_bus_add(struct acpi_device *device)
 
 	video->pm_nb.notifier_call = acpi_video_resume;
 	video->pm_nb.priority = 0;
-	register_pm_notifier(&video->pm_nb);
+	error = register_pm_notifier(&video->pm_nb);
+	if (error)
+		goto err_stop_video;
+
+	error = input_register_device(input);
+	if (error)
+		goto err_unregister_pm_notifier;
 
 	return 0;
 
- err_free_input_dev:
-	input_free_device(input);
+ err_unregister_pm_notifier:
+	unregister_pm_notifier(&video->pm_nb);
  err_stop_video:
 	acpi_video_bus_stop_devices(video);
+ err_free_input_dev:
+	input_free_device(input);
+ err_put_video:
 	acpi_video_bus_put_devices(video);
 	kfree(video->attached_array);
  err_free_video:
@@ -1722,9 +1762,18 @@ static int acpi_video_bus_remove(struct acpi_device *device, int type)
 	return 0;
 }
 
+static int __init is_i740(struct pci_dev *dev)
+{
+	if (dev->device == 0x00D1)
+		return 1;
+	if (dev->device == 0x7000)
+		return 1;
+	return 0;
+}
+
 static int __init intel_opregion_present(void)
 {
-#if defined(CONFIG_DRM_I915) || defined(CONFIG_DRM_I915_MODULE)
+	int opregion = 0;
 	struct pci_dev *dev = NULL;
 	u32 address;
 
@@ -1733,13 +1782,15 @@ static int __init intel_opregion_present(void)
 			continue;
 		if (dev->vendor != PCI_VENDOR_ID_INTEL)
 			continue;
+		/* We don't want to poke around undefined i740 registers */
+		if (is_i740(dev))
+			continue;
 		pci_read_config_dword(dev, 0xfc, &address);
 		if (!address)
 			continue;
-		return 1;
+		opregion = 1;
 	}
-#endif
-	return 0;
+	return opregion;
 }
 
 int acpi_video_register(void)

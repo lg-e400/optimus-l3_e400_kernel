@@ -21,8 +21,6 @@
 #ifndef _ACPI_INTERNAL_H_
 #define _ACPI_INTERNAL_H_
 
-#include <linux/sysdev.h>
-
 #define PREFIX "ACPI: "
 
 int init_acpi_device_notify(void);
@@ -30,9 +28,10 @@ int acpi_scan_init(void);
 int acpi_sysfs_init(void);
 
 #ifdef CONFIG_DEBUG_FS
+extern struct dentry *acpi_debugfs_dir;
 int acpi_debugfs_init(void);
 #else
-static inline int acpi_debugfs_init(void) { return 0; }
+static inline void acpi_debugfs_init(void) { return; }
 #endif
 
 /* --------------------------------------------------------------------------
@@ -59,12 +58,11 @@ struct acpi_ec {
 	unsigned long data_addr;
 	unsigned long global_lock;
 	unsigned long flags;
-	struct mutex lock;
+	struct mutex mutex;
 	wait_queue_head_t wait;
 	struct list_head list;
 	struct transaction *curr;
-	spinlock_t curr_lock;
-	struct sys_device sysdev;
+	spinlock_t lock;
 };
 
 extern struct acpi_ec *first_ec;
@@ -94,5 +92,12 @@ static inline void suspend_nvs_free(void) {}
 static inline int suspend_nvs_save(void) { return 0; }
 static inline void suspend_nvs_restore(void) {}
 #endif
+
+/*--------------------------------------------------------------------------
+				Platform bus support
+  -------------------------------------------------------------------------- */
+struct platform_device;
+
+struct platform_device *acpi_create_platform_device(struct acpi_device *adev);
 
 #endif /* _ACPI_INTERNAL_H_ */

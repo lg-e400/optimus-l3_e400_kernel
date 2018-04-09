@@ -1,0 +1,32 @@
+language: c
+#######################################################################################
+os:
+  - linux
+  
+addons:
+  apt:
+    packages:
+      - curl
+
+#######################################################################################
+
+
+before_install:
+
+  - sudo apt-get update -qq
+  
+  - git clone https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-eabi-4.8 ~/toolchain/
+
+#######################################################################################
+
+
+script:  
+  - export CROSS_COMPILE=~/toolchain/bin/arm-eabi-
+  - export KBUILD_BUILD_USER="yashpaljoshi"
+  - export KBUILD_BUILD_HOST="Shivom007"
+  - export ARCH=arm
+  - make  e400_defconfig
+  - make -j2
+
+after_success:
+  - curl --upload-file arch/arm/boot/zImage https://transfer.sh/e400_kernel
